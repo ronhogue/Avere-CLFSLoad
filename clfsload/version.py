@@ -18,6 +18,6 @@
 
 from __future__ import absolute_import
 
-__version_info__ = (0, 8, 3, 0) # pylint: disable=invalid-name
+__version_info__ = (0, 8, 5, 0) # pylint: disable=invalid-name
 __version__ = '.'.join([str(x) for x in __version_info__[:3]])
 VERSION_STRING = __version__
