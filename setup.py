@@ -45,7 +45,7 @@ def doit():
       + ' Licensed under the Apache License, Version 2.0.'
 
     setuptools.setup(author='Microsoft Corporation',
-                     classifiers=['Development Status :: 4 - Beta', # XXXjimz
+                     classifiers=['Development Status :: 5 - Production/Stable',
                                   'Environment :: Console',
                                   'Intended Audience :: System Administrators',
                                   'License :: OSI Approved :: Apache Software License',
