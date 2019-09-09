@@ -1,4 +1,4 @@
-# Using Avere-CLFSLoad to populate Azure Blob cache storage
+# Use Avere-CLFSLoad to populate Azure Blob cache storage
 
 Avere CLFSLoad is a Python-based tool that copies data into Azure Blob storage
 containers and stores it in Microsoft's Avere Cloud FileSystem (CLFS) format.
@@ -14,6 +14,8 @@ example, to pre-populate storage or to add files to a working set without
 increasing cache load. (For other data ingest methods, read [Moving data to the
 Avere vFXT for Azure 
 cluster](<https://docs.microsoft.com/azure/avere-vfxt/avere-vfxt-data-ingest>).)
+
+> **NOTE:** This is a preview release of CLFSLoad. Please report any issues to the email address in [Reporting problems](#reporting-problems), below. 
 
 CLFSLoad runs on one Linux node and transfers a single rooted subtree. It
 assumes that the source tree does not change during the transfer. 
