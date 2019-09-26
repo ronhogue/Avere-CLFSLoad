@@ -1,0 +1,10 @@
+azure-common
+azure-storage-blob
+defusedxml
+lz4
+psutil
+setuptools
+sqlalchemy
+tabulate
+urllib3
+wheel

@@ -19,8 +19,6 @@
 Types supporting multiprocessing communication
 '''
 
-from __future__ import absolute_import
-
 import collections
 import logging
 import queue
@@ -28,7 +26,7 @@ import threading
 import time
 import traceback
 
-from clfsload.types import GenericStats, Timer, WRock
+from clfsload.stypes import GenericStats, Timer, WRock
 from clfsload.util import elapsed, exc_log, getframe
 
 class PcomBase():

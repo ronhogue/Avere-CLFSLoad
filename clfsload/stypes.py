@@ -1,5 +1,5 @@
 #
-# clfsload/types.py
+# clfsload/stypes.py
 #
 #-------------------------------------------------------------------------
 # Copyright (c) Microsoft.  All rights reserved.
@@ -16,10 +16,6 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import collections # for deque
 from collections import OrderedDict
 import argparse
@@ -33,14 +29,16 @@ import os
 import pprint
 import random
 import struct
+import sys
 import threading
 import time
 import uuid
 
-from sqlalchemy import BINARY, Column, Float, Index, Integer, Text, VARCHAR
+from sqlalchemy import BINARY, Column, Float, Index, Integer, VARCHAR
 from sqlalchemy.ext.declarative import declarative_base
 
 from clfsload.util import Size, SorterBase, UINT64_MAX, elapsed, log_level_get, pretty_time
+from clfsload.version import VERSION_STRING
 
 # Maximum links to a single target supported by CLFS (IOW, max backpointer count)
 CLFS_LINK_MAX = 1023
@@ -132,6 +130,7 @@ class CommandArgs():
 
     # defaults for optional arguments
     new = False
+    azcopy = False
     dry_run = False
     dry_run_gb = None
     dry_run_count = None
@@ -142,18 +141,23 @@ class CommandArgs():
     preserve_hardlinks = 0
     retry_errors = 1
 
-    def __init__(self, logger):
+    def __init__(self, logger, prog=None, add_version=False):
         self._logger = logger # leveraged by tests
+        self._prog = prog.strip() if prog else 'CLFSLoad'
         self.log_level = self._logger.level
         self._handle_local_state_path = getattr(self, '_handle_local_state_path', True)
         self._handle_source_root_args = getattr(self, '_handle_source_root_args', True)
         self._handle_target_container_args = getattr(self, '_handle_target_container_args', True)
+        self._handle_azcopy_args = getattr(self, '_handle_azcopy_args', True)
         self._handle_dry_run_args = getattr(self, '_handle_dry_run_args', True)
         self._handle_compression_args = getattr(self, '_handle_compression_args', len(self.COMPRESSION_TYPE_DEFAULT) > 1)
         self._handle_encryption_args = getattr(self, '_handle_encryption_args', len(self.ENCRYPTION_TYPES) > 1)
         self._handle_preserve_hardlinks_args = getattr(self, '_handle_preserve_hardlinks_args', True)
         self._handle_retry_error_args = getattr(self, '_handle_retry_error_args', True)
-        self._parser = argparse.ArgumentParser()
+        self._parser = argparse.ArgumentParser(prog=self._prog)
+        if add_version:
+            self._parser.add_argument("--version", action="version",
+                                      version=self.version_string())
         try:
             self.worker_thread_count = self._get_worker_thread_count_default()
         except:
@@ -176,6 +180,11 @@ class CommandArgs():
         if self._handle_local_state_path:
             self._parser.add_argument("--new", action="store_true",
                                       help="start a new transfer")
+        if self._handle_azcopy_args:
+            self._parser.add_argument("--azcopy", action="store_true",
+                                      help="executing on behalf of azcopy")
+        else:
+            self.azcopy = False
         if self._handle_dry_run_args:
             self._parser.add_argument("--dry_run", action="store_true",
                                       help="perform a dry-run to approximate the count of entities and the capacity that must be transferred")
@@ -240,6 +249,12 @@ class CommandArgs():
         # _WORKER_THREAD_COUNT_MIN <= count <= _WORKER_THREAD_COUNT_MAX
         return min(max(count, cls._WORKER_THREAD_COUNT_MIN), cls._WORKER_THREAD_COUNT_MAX)
 
+    def version_string(self):
+        '''
+        Return a string describing the version
+        '''
+        return "%s %s  (Python %s)" % (self._prog, VERSION_STRING.strip(), sys.version.split('\n')[0].strip())
+
     def add_argument(self, argname, *args, **kwargs):
         '''
         Add an argument by invoking parser.add_argument(argname, *args, **kwargs).
@@ -276,6 +291,10 @@ class CommandArgs():
             self.new = self._args.new
         else:
             self.new = False
+        if self._handle_azcopy_args:
+            self.azcopy = self._args.azcopy
+        else:
+            self.azcopy = False
         if self._handle_dry_run_args:
             self.dry_run = self._args.dry_run
             self.dry_run_gb = self._args.dry_run_gb
@@ -403,7 +422,7 @@ class NamedObjectError(CLFSLoadException):
     'Base class for errors that are specific to a named object'
     def __init__(self, name, msg, *args, **kwargs):
         if isinstance(name, TargetObj):
-            self.name = name.source_path
+            self.name = name.source_path_str
         else:
             self.name = name
         self.name = str(self.name)
@@ -759,8 +778,8 @@ class TargetObjectError(NamedObjectError):
         Pick up any additional interesting info from tobj
         '''
         updated = False
-        if ('source_path' not in self._kwargs) and tobj.source_path:
-            self._kwargs['source_path'] = tobj.source_path
+        if ('source_path' not in self._kwargs) and tobj.has_source_path():
+            self._kwargs['source_path'] = tobj.source_path_str
             updated = True
         if updated:
             self._usr_msg = self._usr_msg_compute()
@@ -1039,6 +1058,13 @@ class Phase(enum.Enum):
         assert self == self.DONE
         return False
 
+    def azcopy_name(self):
+        '''
+        Return the azcopy-facing phase name
+        '''
+        txt = str(self).split('.')[-1]
+        return txt[0].upper() + txt[1:].lower()
+
 class GenericStats():
     '''
     Base class for collecting statistics
@@ -1092,6 +1118,12 @@ class GenericStats():
         with self._lock:
             return self._stats.get(name, 0)
 
+    def get_NL(self, name):
+        '''
+        Get the current value of the named stat -- caller holds the lock
+        '''
+        return self._stats.get(name, 0)
+
     def stat_min(self, name, val):
         'Update the stat with val only if val is less than the current value.'
         with self._lock:
@@ -1105,6 +1137,13 @@ class GenericStats():
             cur = self._stats.get(name, None)
             if (cur is None) or cur < val:
                 self._stats[name] = val
+
+    def stat_set(self, name, val):
+        '''
+        Perform an absolute set on the named stat
+        '''
+        with self._lock:
+            self._stats[name] = val
 
     def stat_add(self, name, val):
         'Add val to the named stat'
@@ -1171,13 +1210,31 @@ class GenericStats():
                              (self.__class__.__name__, k, v.__class__.__name__, other.__class__.__name__,
                               e.__class__.__name__, e))
 
-    def report_short(self, cur_ts, elapsed_secs, clfsload, historical_perf): # pylint: disable=unused-argument
-        'Return a short single-line report suitable for a quick status update'
+    def report_short(self, cur_ts, elapsed_secs, clfsload, *args, **kwargs):
+        '''
+        Return a dict containing:
+            simple: short single-line report suitable for a quick status update.
+        '''
         with self._lock:
-            return "elapsed=%.1f %s" % (elapsed_secs, str(self))
+            ret = {'simple' : self._report_short_NL(cur_ts, elapsed_secs, clfsload, *args, **kwargs)}
+            return ret
+
+    def _report_short_NL(self,
+                         cur_ts, # pylint: disable=unused-argument
+                         elapsed_secs,
+                         clfsload, # pylint: disable=unused-argument
+                         historical_perf, # pylint: disable=unused-argument
+                         report_is_interval=False, # pylint: disable=unused-argument
+                         report_is_final=False): # pylint: disable=unused-argument
+        '''
+        Return a short single-line report suitable for a quick status update
+        '''
+        return "elapsed=%.1f %s" % (elapsed_secs, str(self))
 
     def report_final(self, logger, secs_elapsed):
-        'additional logging at end-of-life'
+        '''
+        Additional logging at end-of-life
+        '''
         # noop here in base class
 
 class Timer():
@@ -1217,9 +1274,9 @@ class Timer():
 
 class TimerStats(GenericStats):
     def __init__(self, *args, **kwargs):
+        self._t0 = kwargs.pop('t0', None)
+        self._t1 = kwargs.pop('t1', None)
         super(TimerStats, self).__init__(*args, **kwargs)
-        self._t0 = None
-        self._t1 = None
         self._count = 0
 
     @property
@@ -1267,12 +1324,14 @@ class TimerStats(GenericStats):
                     self._t1 = other.t1
 
     def elapsed_dict(self):
-        el = elapsed(self._t0, self._t1)
+        t0 = self._t0 if self._t0 is not None else time.time()
+        t1 = self._t1 if self._t1 is not None else time.time()
+        el = elapsed(t0, t1)
         ret = {'_elapsed' : el}
         with self._lock:
             ret['_count'] = self._count
             for k, v in self._stats.items():
-                pcg = (v/el) * 100.0
+                pcg = ((v/el) * 100.0) if el else 100.0
                 if self._count:
                     pcg /= self._count
                 ret[k] = "%.9f (%.02f%%)" % (v, pcg)
@@ -1280,13 +1339,39 @@ class TimerStats(GenericStats):
 
 class DBStats(GenericStats):
     'Database stats'
-    _INITIAL_DB_STATS = {'flush_update_tobj_deferred' : 0,
+    _INITIAL_DB_STATS = {'error_count_entity' : 0,
+                         'flush_count' : 0,
+                         'flush_seconds' : 0.0,
+                         'flush_update_tobj_deferred' : 0,
                          'flush_upsert_tobj_slowpath' : 0,
+                         'snap0_flush_count' : 0,
+                         'snap0_flush_seconds' : 0.0,
+                         'snap1_flush_count' : 0,
+                         'snap1_flush_seconds' : 0.0,
+                         'snap2_flush_count' : 0,
+                         'snap2_flush_seconds' : 0.0,
                         }
 
     def __init__(self, *args, **kwargs):
         super(DBStats, self).__init__(*args, **kwargs)
         self._stats.update(self._INITIAL_DB_STATS)
+
+    def stat_snap_flush_NL(self):
+        '''
+        Take a snapshot of recent flush times.
+        snap0: accumulated flush since last snap
+        snap1: the most recent nonzero snap0
+        snap2: previous snap1 (whether or not it changed)
+        Caller holds the lock.
+        '''
+        with self._lock:
+            self._stats['snap2_flush_count'] = self._stats['snap1_flush_count']
+            self._stats['snap2_flush_seconds'] = self._stats['snap1_flush_seconds']
+            if self._stats['snap0_flush_count']:
+                self._stats['snap1_flush_count'] = self._stats['snap0_flush_count']
+                self._stats['snap1_flush_seconds'] = self._stats['snap0_flush_seconds']
+            self._stats['snap0_flush_count'] = 0
+            self._stats['snap0_flush_seconds'] = 0.0
 
 class WorkerThreadStats(GenericStats):
     'Statistics for any worker thread'
@@ -1309,6 +1394,193 @@ class WorkerThreadStats(GenericStats):
         super(WorkerThreadStats, self).__init__(*args, **kwargs)
         self._stats.update(self._INITIAL_WORKER_THREAD_STATS_COMMON)
         self._stats.update(self._INITIAL_WORKER_THREAD_STATS_SPECIFIC)
+
+        self._t0 = None
+
+        # AzCopy does not operate in terms of namespace, so it
+        # thinks about files as the set of everything. We include
+        # directories here because they represent real loads
+        # and stores for CLFS.
+        #
+        # Many of these values are reported to AzCopy.
+        #
+        self._files_total = None
+        self._files_completed_total = None
+        self._files_completed_failed = None
+        self._gb_completed = None
+        self._bytes_completed = None
+        self._gb_total = None
+        self._bytes_total = None
+        self._throughput_Mbps = None # megabits per second
+        self._throughput_delta_secs = None # window size for self._throughput_Mbps
+        self.throughput_last_time = None # last time self._throughput_Mbps was sampled
+        self._throughput_last_gb_completed = 0.0
+        self.__eta = None
+        self._pct_files = None
+        self._pct_bytes = None
+        self._pct_eta = None
+
+    @property
+    def eta(self):
+        '''
+        Readonly external accessor for ETA
+        '''
+        return self.__eta
+
+    @property
+    def _eta(self):
+        '''
+        Internal accessor for ETA
+        '''
+        return self.__eta
+
+    @_eta.setter
+    def _eta(self, eta):
+        '''
+        Internal setter for ETA. Caller must not hold self._lock.
+        If self._lock is held, use _eta_set_NL().
+        '''
+        with self._lock:
+            self._eta_set_NL(eta, time.time())
+
+    @property
+    def pct_files(self):
+        '''
+        Return the most recent pct_files.
+        Save with or without the lock, but only atomic
+        wrt other percentages when holding the lock.
+        '''
+        return self._pct_files
+
+    @property
+    def pct_bytes(self):
+        '''
+        Return the most recent pct_bytes.
+        Save with or without the lock, but only atomic
+        wrt other percentages when holding the lock.
+        '''
+        return self._pct_bytes
+
+    @property
+    def pct_eta(self):
+        '''
+        Return the most recent pct_eta.
+        Save with or without the lock, but only atomic
+        wrt other percentages when holding the lock.
+        '''
+        return self._pct_eta
+
+    @property
+    def t0(self):
+        '''
+        Read-only accessor. Safe with or without self._lock held.
+        '''
+        return self._t0
+
+    @t0.setter
+    def t0(self, value):
+        '''
+        Update accessor. Caller must not hold self._lock.
+        '''
+        with self._lock:
+            assert self._t0 is None
+            self._t0 = value
+
+    def _eta_set_NL(self, eta, cur_ts):
+        '''
+        Update self.__eta (self._eta) and self._pct_eta.
+        Caller holds self._lock.
+        '''
+        self.__eta = eta
+        if eta is None:
+            self._pct_eta = None
+            return
+        t0 = self._t0
+        if (eta <= t0) or (eta <= cur_ts):
+            self._pct_eta = 100.0
+            return
+        if cur_ts < t0:
+            self._pct_eta = 0.0
+            return
+        # t0 <= cur_ts <= eta
+        est = elapsed(t0, eta)
+        cur = elapsed(t0, cur_ts)
+        self._pct_eta = 100.0 * (cur / est)
+
+    def _update_throughput_NL(self, cur_ts):
+        '''
+        Update self._throughput attributes based
+        on current self contents. Caller holds self._lock.
+        '''
+        if self._gb_completed is not None:
+            if self.throughput_last_time is not None:
+                self._bytes_completed = self._gb_completed * Size.GB
+                te = elapsed(self.throughput_last_time, cur_ts)
+                if te > 0.0:
+                    self._throughput_delta_secs = te
+                    gb = max(self._gb_completed - self._throughput_last_gb_completed, 0.0)
+                    megabits = gb * 8192.0 # gigabytes to megabits
+                    self._throughput_Mbps = megabits / te
+                    self._throughput_last_gb_completed = self._gb_completed
+                    self.throughput_last_time = cur_ts
+                # If te <= 0.0, the clock did not advance.
+                # Do not update throughpuut values.
+                # When the clock advances, we will see the
+                # accumulated bytecount changes.
+            else:
+                self._throughput_last_gb_completed = self._gb_completed
+                self.throughput_last_time = cur_ts
+        else:
+            self._bytes_completed = None
+            self._throughput_Mbps = None
+
+    def eta_str(self):
+        '''
+        Return a human-readable string for self._eta.
+        This is prefixed with a space if not empty.
+        '''
+        if not self._eta:
+            return ''
+        eta = math.ceil(self._eta)
+        return ' ' + time.strftime('%Y-%m-%d %H:%M:%S %Z', time.localtime(eta)) + " (%.1f%%)" % self._pct_eta
+
+    def _almost_finished(self):
+        '''
+        Helper so that we generate ETAs during the final portions
+        where we are just writing out directories.
+        '''
+        return self._pct_files > 99 and self._pct_bytes > 99
+
+    def report_short(self, cur_ts, elapsed_secs, clfsload, *args, **kwargs):
+        '''
+        Return a dict containing:
+            simple: short single-line report suitable for a quick status update.
+            Other values are straight stats copies obtained under the same lock.
+            (Exporting additional values supports azcopy and testing.)
+        Side-effect updates:
+            self._eta self._pct_files self._pct_bytes self._pct_eta
+        '''
+        with self._lock:
+            self._files_completed_failed = clfsload.db.stats.get('error_count_entity')
+            # Complete _report_short_NL() BEFORE constructing the dict.
+            # Some dict contents are set as side effects of _report_short_NL().
+            simple = self._report_short_NL(cur_ts, elapsed_secs, clfsload, *args, **kwargs)
+            ret = {'elapsed' : elapsed(self._t0, cur_ts),
+                   'files_total' : self._files_total,
+                   'files_completed_total' : self._files_completed_total,
+                   'files_completed_failed' : self._files_completed_failed,
+                   'bytes_completed' : self._bytes_completed,
+                   'bytes_total' : self._bytes_total,
+                   'pct_bytes' : self._pct_bytes,
+                   'pct_eta' : self._pct_eta,
+                   'pct_files' : self._pct_files,
+                   'simple' : simple,
+                   'throughput_Mbps' : self._throughput_Mbps,
+                   'throughput_delta_secs' : self._throughput_delta_secs,
+                   'time_eta' : self.__eta,
+                   'time_report' : cur_ts,
+                  }
+            return ret
 
     def report_final(self, logger, secs_elapsed):
         'see base class'
@@ -1333,14 +1605,6 @@ class WorkerThreadStats(GenericStats):
         dumpkeys.sort()
         return ["  %-*s %s" % (keylenmax, k, self._stats[k]) for k in dumpkeys]
 
-    @staticmethod
-    def _toc_flush_estimate(db):
-        'estimate the time to flush remaining TOC batches'
-        # Somewhat arbitrary: estimate another 500ms for each toc in the queue.
-        # The queue will grow and shrink while we run, but at the end of the
-        # transfer we must flush what remains.
-        return db.toc_queue_len() * 0.5
-
 class InitStats(WorkerThreadStats):
     '''
     Statistics for the INIT phase.
@@ -1350,18 +1614,22 @@ class InitStats(WorkerThreadStats):
     # No specializations for this phase
 
 class _HistoricalPerfData():
-    'Convenience structure to hold historical perf data'
-    def __init__(self, write_rate_mb, rate_count, total_count, count_nondir, gb_write, gb_read, time_secs):
+    '''
+    Convenience structure to hold historical perf data
+    ckpt indicates whether or not this is a formal report
+    If ckpt is not set, this item is later discarded.
+    '''
+    def __init__(self, write_rate_mb, rate_count, total_count, count_nondir, gb_write, time_secs, ckpt=False):
         self.write_rate_mb = write_rate_mb
         self.rate_count = rate_count
         self.total_count = total_count
         self.count_nondir = count_nondir
         self.gb_write = gb_write
-        self.gb_read = gb_read
         self.time_secs = time_secs
+        self.ckpt = ckpt
 
     def __str__(self):
-        return "write_rate_mb %f, rate_count %f, total_count %f, count_nondir %f, gb_write %f, gb_read %f, time %f" % (self.write_rate_mb, self.rate_count, self.total_count, self.count_nondir, self.gb_write, self.gb_read, self.time_secs)
+        return "write_rate_mb %f, rate_count %f, total_count %f, count_nondir %f, gb_write %f, time %f" % (self.write_rate_mb, self.rate_count, self.total_count, self.count_nondir, self.gb_write, self.time_secs)
 
 class HistoricalPerf():
     '''
@@ -1392,19 +1660,22 @@ class HistoricalPerf():
             self._max_history_secs = self._MAX_HISTORY_SECS
             self._perf_buckets = [0 for _ in range(self._NUM_PERF_BUCKETS)]
 
-    def append(self, cur_ts, gb_write, gb_read, count_dir, count_nondir):
+    def append(self, cur_ts, gb_write, count_dir, count_nondir, ckpt=True):
         'Append to our perf history, updating the proper perf bucket.'
         total_count = count_dir + count_nondir
+        # Discard temporary sample(s) at the head
+        while self._reports and (not self._reports[0].ckpt):
+            self._reports.popleft()
         if not self._reports:
             # empty queue, just append the new item
-            self._reports.appendleft(_HistoricalPerfData(0.0, 0.0, total_count, count_nondir, gb_write, gb_read, cur_ts))
+            self._reports.appendleft(_HistoricalPerfData(0.0, 0.0, total_count, count_nondir, gb_write, cur_ts, ckpt=ckpt))
             return
         # Calculate the most recent rates since our last update, and append the new data
         head = self._reports[0]
         elapsed_secs = elapsed(head.time_secs, cur_ts)
         write_rate_mb = (gb_write - head.gb_write) * 1000.0 / elapsed_secs if elapsed_secs > 0 else 0
         rate_count = (total_count - head.total_count) / elapsed_secs if elapsed_secs > 0 else 0
-        self._reports.appendleft(_HistoricalPerfData(write_rate_mb, rate_count, total_count, count_nondir, gb_write, gb_read, cur_ts))
+        self._reports.appendleft(_HistoricalPerfData(write_rate_mb, rate_count, total_count, count_nondir, gb_write, cur_ts, ckpt=ckpt))
         # prune stat data that is older than we currently care about
         oldest_secs = cur_ts - self._max_history_secs
         while len(self._reports) > 1:
@@ -1417,13 +1688,12 @@ class HistoricalPerf():
         # Update our performance buckets based upon our historical data
         tail = self._reports[-1]
         hist_elapsed_sec = elapsed(tail.time_secs, cur_ts)
-        if hist_elapsed_sec < self._MIN_HISTORY_SECS:
-            return
-        hist_gb_read = gb_read - tail.gb_read
-        hist_files = max(count_nondir - tail.count_nondir, 1)  # prevent possible div by zero later
-        hist_file_size_kb = Size.MB * hist_gb_read / hist_files
-        hist_rate_mb = 1000.0 * hist_gb_read / hist_elapsed_sec
-        self._update_bucket_rate(hist_rate_mb, hist_file_size_kb)
+        if hist_elapsed_sec >= self._MIN_HISTORY_SECS:
+            hist_gb_write = gb_write - tail.gb_write
+            hist_files = max(count_nondir - tail.count_nondir, 1)  # prevent possible div by zero later
+            hist_file_size_kb = Size.MB * hist_gb_write / hist_files
+            hist_rate_mb = 1000.0 * hist_gb_write / hist_elapsed_sec
+            self._update_bucket_rate(hist_rate_mb, hist_file_size_kb)
 
     def get_latest_write_rates(self):
         if not self._reports:
@@ -1499,179 +1769,202 @@ class HistoricalPerf():
         return 0
 
 class TransferStats(WorkerThreadStats):
-    'Statistics for the transfer phase'
+    '''
+    Statistics for the transfer phase
+    '''
     _INITIAL_WORKER_THREAD_STATS_SPECIFIC = {'fh_regenerate' : 0,
                                             }
 
-    def __init__(self, *args, **kwargs):
-        'Overrides base class so we can save ETAs for testing purposes'
-        super(TransferStats, self).__init__(*args, **kwargs)
-        self._eta = None
-        self._pct_files = None
-        self._pct_bytes = None
-
-    @property
-    def eta(self):
-        return self._eta
-
-    @property
-    def pct_files(self):
-        return self._pct_files
-
-    @property
-    def pct_bytes(self):
-        return self._pct_bytes
-
-    def _almost_finished(self):
+    def _report_short_NL(self,
+                         cur_ts,
+                         elapsed_secs,
+                         clfsload,
+                         historical_perf,
+                         report_is_interval=False,
+                         report_is_final=False):
         '''
-        Helper so that we generate ETAs during the final portions
-        where we are just writing out directories.
+        Type-specific internals for report_short().
+        Called with self._lock held.
         '''
-        return self._pct_files > 99 and self._pct_bytes > 99
-
-    def report_short(self, cur_ts, elapsed_secs, clfsload, historical_perf):
-        'Return a short single-line report suitable for a quick status update'
         db = clfsload.db
-        with self._lock:
-            count_dir = self._stats['count_dir']
-            count_nondir = self._stats['count_nondir']
-            total_count = count_dir + count_nondir
-            gb_write = self._stats.get('gb_write', 0.0)
-            gb_read = self._stats.get('gb_read', 0.0)  # zero if no dry-run data
-            write_blob_count = self._stats.get('write_blob_count', 0)
-            # calculate cumulative write rates
-            if elapsed_secs:
-                cumulative_count = total_count / elapsed_secs
-                cumulative_mb = (1000.0 * gb_write) / elapsed_secs
-            else:
-                cumulative_count = total_count
-                cumulative_mb = 0.0
-            # get rates based on most recent rate calculations
-            historical_perf.append(cur_ts, gb_write, gb_read, count_dir, count_nondir)
-            recent_mb, recent_count = historical_perf.get_latest_write_rates()
-            count_str = "files_written=%d (dir/nondir=%d/%d)" % (total_count, count_dir, count_nondir)
-            # Include saved values from process restarts in the remaining report data
-            total_gb_write = gb_write
-            total_gb_read = gb_read
-            if db.dr_init.dr_gb is not None:
-                total_gb_write += db.dr_init.dr_gb
-                total_gb_read += db.dr_init.dr_gb
-            if db.dr_init.dr_count is not None:
-                total_count += db.dr_init.dr_count
-            gb_str = "GB=%.6f" % total_gb_write
-            eta_str = ''
-            if db.dr_input.dr_count is not None and db.dr_input.dr_count > 0:
+        count_dir = self._stats['count_dir']
+        count_nondir = self._stats['count_nondir']
+        total_count = count_dir + count_nondir
+        gb_write = self._stats.get('gb_write', 0.0)
+        write_blob_count = self._stats.get('write_blob_count', 0)
+        # calculate cumulative write rates
+        if elapsed_secs:
+            cumulative_count = total_count / elapsed_secs
+            cumulative_mb = (1000.0 * gb_write) / elapsed_secs
+        else:
+            cumulative_count = total_count
+            cumulative_mb = 0.0
+        # get rates based on most recent rate calculations
+        historical_perf.append(cur_ts, gb_write, count_dir, count_nondir, ckpt=report_is_interval)
+        recent_mb, recent_count = historical_perf.get_latest_write_rates()
+        count_str = "written=%d (dir/nondir=%d/%d)" % (total_count, count_dir, count_nondir)
+        # Include saved values from process restarts in the remaining report data
+        total_gb_write = gb_write
+        if db.dr_init.dr_gb is not None:
+            total_gb_write += db.dr_init.dr_gb
+        if db.dr_init.dr_count is not None:
+            total_count += db.dr_init.dr_count
+        self._files_completed_total = total_count
+        self._gb_completed = total_gb_write
+        gb_str = "GB=%.6f" % total_gb_write
+        eta_str = ''
+        if db.dr_input.dr_count is not None:
+            self._files_total = db.dr_input.dr_count
+            if db.dr_input.dr_count > 0:
                 self._pct_files = 100.0 * (total_count / db.dr_input.dr_count) if total_count > 0 else 0.0
                 count_str += " (%.1f%%)" % self._pct_files
-            if db.dr_input.dr_gb is not None and db.dr_input.dr_gb > 0:
-                self._pct_bytes = 100.0 * (total_gb_read / db.dr_input.dr_gb) if total_gb_read > 0 else 0.0
+        if db.dr_input.dr_gb is not None:
+            self._gb_total = db.dr_input.dr_gb
+            self._bytes_total = self._gb_total * Size.GB
+            if db.dr_input.dr_gb > 0:
+                self._pct_bytes = 100.0 * (total_gb_write / db.dr_input.dr_gb) if total_gb_write > 0 else 0.0
                 gb_str += " (%.1f%%)" % self._pct_bytes
-                # Start making eta estimates after we collect at least one minute of data.
-            if historical_perf.perf_data_ready:
-                if total_gb_read < db.dr_input.dr_gb:
-                    # We haven't finished transferring everything, make a reasonable guess at the ETA
-                    remaining_gb = db.dr_input.dr_gb - total_gb_read
-                    remaining_file_count = db.dr_input.dr_count - total_count
-                    remaining_mean_file_size = remaining_gb * Size.GB / max(remaining_file_count, 1)
-                    projected_rate_mb = historical_perf.projected_rate_mb_by_file_size(remaining_mean_file_size)
-                    projected_rate_fps = historical_perf.projected_rate_fps()
-                    est_transfer = 0
-                    if projected_rate_mb > 0:
-                        # how long to transfer remaining_gb
-                        est_transfer = remaining_gb * 1000.0 / projected_rate_mb
-                    elif projected_rate_fps > 0:
-                        # how long to transfer remaining file count
-                        # (only used when rate_mb is zero)
-                        est_transfer = remaining_file_count / projected_rate_fps
-                    if est_transfer > 0 or self._almost_finished():
-                        self._eta = cur_ts + est_transfer
-                        self._eta += self._toc_flush_estimate(db)
-                        self._eta = math.ceil(self._eta) + 1
-                        eta_str = time.strftime(' ETA: %Y-%m-%d %H:%M:%S %Z', time.localtime(self._eta))
+        self._update_throughput_NL(cur_ts)
+        db_queue_len, db_queue_est = db.toc_queue_est(snap=report_is_interval)
+        assert db_queue_est >= 0.0
+        if historical_perf.perf_data_ready:
+            eta = None
+            if total_gb_write < db.dr_input.dr_gb:
+                # We haven't finished transferring everything, make a reasonable guess at the ETA
+                remaining_gb = db.dr_input.dr_gb - total_gb_write
+                remaining_file_count = db.dr_input.dr_count - total_count
+                remaining_mean_file_size = remaining_gb * Size.GB / max(remaining_file_count, 1)
+                projected_rate_mb = historical_perf.projected_rate_mb_by_file_size(remaining_mean_file_size)
+                projected_rate_fps = historical_perf.projected_rate_fps()
+                est_transfer = 0
+                if projected_rate_mb > 0:
+                    # how long to transfer remaining_gb
+                    est_transfer = remaining_gb * 1000.0 / projected_rate_mb
+                elif projected_rate_fps > 0:
+                    # how long to transfer remaining file count
+                    # (only used when rate_mb is zero)
+                    est_transfer = remaining_file_count / projected_rate_fps
+                if (est_transfer > 0) or self._almost_finished():
+                    eta = cur_ts + est_transfer
+                    eta += db_queue_est
                 else:
-                    # We've already transferred more data than expected, make a guess that we'll be done soon
-                    eta_str = time.strftime(' ETA: %Y-%m-%d %H:%M:%S %Z', time.localtime(time.time() + 60))
-            blob_str = " blobs=%d" % write_blob_count
-            return "elapsed=%f recent_rate(fps/mbps)=%.1f/%.2f cumulative_rate=%.1f/%.2f db_queue_len=%d%s %s %s%s" \
-              % (elapsed_secs, recent_count, recent_mb, cumulative_count, cumulative_mb,
-                 db.toc_queue_len(), blob_str, count_str, gb_str, eta_str)
+                    eta = cur_ts
+            elif total_gb_write == db.dr_input.dr_gb:
+                eta = cur_ts + db_queue_est
+            else:
+                # We've already transferred more data than expected, make a guess that we'll be done soon
+                eta = cur_ts + 60.0
+            if eta is not None:
+                eta = max(eta, cur_ts+db_queue_est)
+                self._eta_set_NL(eta, cur_ts)
+                eta = math.ceil(eta)
+                if not report_is_final:
+                    eta_str = self.eta_str()
+        blob_str = "blobs=%d" % write_blob_count
+        return "elapsed=%f recent(fps/mbps)=%.1f/%.2f cumulative=%.1f/%.2f db_queue_len=%d/%.3f %s %s %s%s" \
+          % (elapsed_secs, recent_count, recent_mb, cumulative_count, cumulative_mb,
+             db_queue_len, db_queue_est, blob_str, count_str, gb_str, eta_str)
 
 class ReconcileStats(WorkerThreadStats):
-    'Statistics for the reconcile phase'
-    def report_short(self, cur_ts, elapsed_secs, clfsload, historical_perf):
-        'Return a short single-line report suitable for a quick status update'
+    '''
+    Statistics for the reconcile phase
+    '''
+    def _report_short_NL(self,
+                         cur_ts,
+                         elapsed_secs,
+                         clfsload,
+                         historical_perf,
+                         report_is_interval=False,
+                         report_is_final=False):
+        '''
+        Type-specific internals for report_short().
+        Called with self._lock held.
+        '''
         db = clfsload.db
         total = clfsload.reconcile_total_count
-        with self._lock:
-            count_dir = self._stats['count_dir']
-            count_nondir = self._stats['count_nondir']
-            count = count_dir + count_nondir
-            if elapsed_secs and count:
-                mean = elapsed_secs / count
-            else:
-                mean = 0.0
-            eta = cur_ts
-            eta_str = ''
-            if total:
-                cpct = 100.0 * (count / total)
-                if count < total:
-                    remain = total - count
-                    eta += mean * remain
-            else:
-                cpct = 100.0
-            # Compute estimated completion time if we are not done
-            # and we have been running for at least 60 seconds. We
-            # wait 60 seconds to ensure that we have enough historic
-            # data to make at least a minimally credible estimate.
-            if (elapsed_secs >= 30.0) and count:
-                eta += self._toc_flush_estimate(db)
-                eta = math.ceil(eta)
-                eta_str = time.strftime(' %Y-%m-%d %H:%M:%S', time.localtime(eta))
-            return "elapsed=%f mean=%.3f db_queue_len=%d reconciled=%d/%d (%.2f%%)%s" \
-              % (elapsed_secs, mean,
-                 db.toc_queue_len(),
-                 count, total, cpct, eta_str)
+        count_dir = self._stats['count_dir']
+        count_nondir = self._stats['count_nondir']
+        count = count_dir + count_nondir
+        self._files_total = total
+        self._files_completed_total = count
+        self._pct_files = (100.0 * (self._files_completed_total / self._files_total)) if self._files_total else 0.0
+        if elapsed_secs and count:
+            mean = elapsed_secs / count
+        else:
+            mean = 0.0
+        eta = cur_ts
+        eta_str = ''
+        if total:
+            self._pct_files = 100.0 * (count / total)
+            if count < total:
+                remain = total - count
+                eta += mean * remain
+        else:
+            self._pct_files = 100.0
+        db_queue_len, db_queue_est = db.toc_queue_est()
+        if (not report_is_final) and count and (elapsed_secs >= 30.0):
+            # Loose accounting for db_queue_est. Inaccuracies
+            # are typically statisticaly insignificant.
+            eta = max(eta, cur_ts+db_queue_est)
+            self._eta_set_NL(eta, cur_ts)
+            eta_str = self.eta_str()
+        return "elapsed=%f mean=%.3f db_queue_len=%d reconciled=%d/%d (%.1f%%)%s" \
+          % (elapsed_secs, mean,
+             db_queue_len,
+             count, total, self._pct_files, eta_str)
 
 class CleanupStats(WorkerThreadStats):
-    'Statistics for the cleanup phase'
+    '''
+    Statistics for the cleanup phase
+    '''
     _INITIAL_WORKER_THREAD_STATS_SPECIFIC = {'delete_blob_count' : 0,
                                              'delete_blob_secs' : 0,
                                             }
-    def report_short(self, cur_ts, elapsed_secs, clfsload, historical_perf):
-        'Return a short single-line report suitable for a quick status update'
+    def _report_short_NL(self,
+                         cur_ts,
+                         elapsed_secs,
+                         clfsload,
+                         historical_perf,
+                         report_is_interval=False,
+                         report_is_final=False):
+        '''
+        Type-specific internals for report_short().
+        Called with self._lock held.
+        '''
         db = clfsload.db
         total = clfsload.cleanup_total_count
-        with self._lock:
-            count_dir = self._stats['count_dir']
-            count_nondir = self._stats['count_nondir']
-            count = count_dir + count_nondir
-            if elapsed_secs and count:
-                rate = count / elapsed_secs
-                mean = elapsed_secs / count
-            else:
-                rate = count
-                mean = 0.0
-            eta = cur_ts
-            eta_str = ''
-            if total:
-                cpct = 100.0 * (count / total)
-                if count < total:
-                    remain = total - count
-                    eta += mean * remain
-            else:
-                cpct = 100.0
-            # Compute estimated completion time if we are not done
-            # and we have been running for at least 60 seconds. We
-            # wait 60 seconds to ensure that we have enough historic
-            # data to make at least a minimally credible estimate.
-            if (elapsed_secs >= 30.0) and count:
-                eta += self._toc_flush_estimate(db)
-                eta = math.ceil(eta)
-                eta_str = time.strftime(' %Y-%m-%d %H:%M:%S', time.localtime(eta))
-            return "elapsed=%f rate=%.1f mean=%.3f db_queue_len=%d cleaned=%d/%d (%.2f%%)%s" \
-              % (elapsed_secs, rate, mean,
-                 db.toc_queue_len(),
-                 count, total, cpct, eta_str)
+        count_dir = self._stats['count_dir']
+        count_nondir = self._stats['count_nondir']
+        count = count_dir + count_nondir
+        self._files_total = total
+        self._files_completed_total = count
+        self._pct_files = (100.0 * (self._files_completed_total / self._files_total)) if self._files_total else 0.0
+        if elapsed_secs and count:
+            rate = count / elapsed_secs
+            mean = elapsed_secs / count
+        else:
+            rate = count
+            mean = 0.0
+        eta = cur_ts
+        eta_str = ''
+        if total:
+            self._pct_files = 100.0 * (count / total)
+            if count < total:
+                remain = total - count
+                eta += mean * remain
+        else:
+            self._pct_files = 100.0
+        db_queue_len, db_queue_est = db.toc_queue_est()
+        if (not report_is_final) and count and (elapsed_secs >= 30.0):
+            # Loose accounting for db_queue_est. Inaccuracies
+            # are typically statisticaly insignificant.
+            eta = max(eta, cur_ts+db_queue_est)
+            self._eta_set_NL(eta, cur_ts)
+            eta_str = self.eta_str()
+        return "elapsed=%f rate=%.1f mean=%.3f db_queue_len=%d cleaned=%d/%d (%.1f%%)%s" \
+          % (elapsed_secs, rate, mean,
+             db_queue_len,
+             count, total, self._pct_files, eta_str)
 
 class FinalizeStats(WorkerThreadStats):
     '''
@@ -1722,7 +2015,9 @@ class TargetObj():
         self.first_backpointer = Filehandle(first_backpointer)
         self.state = state
         self.source_inode_number = source_inode_number
-        self.source_path = source_path
+        # This trusts the caller to not modify source_path
+        # os.fsencode() returns identity for bytes, or encodes str -> bytes
+        self._source_path = os.fsencode(source_path)
         self.reconcile_vers = reconcile_vers
         self.child_dir_count = child_dir_count
         self.pre_error_state = pre_error_state if pre_error_state is not None else state
@@ -1741,7 +2036,7 @@ class TargetObj():
         return "<%s,%s,%s>" % (self.__class__.__name__, hex(id(self)), self.filehandle.hex())
 
     def __str__(self):
-        return "%s(%s,%s)" % (self.__class__.__name__, self.filehandle.hex(), self.source_path)
+        return "%s(%s,%s)" % (self.__class__.__name__, self.filehandle.hex(), self.source_path_str)
 
     def __lt__(self, other):
         return self.filehandle < other.filehandle
@@ -1779,7 +2074,27 @@ class TargetObj():
     @property
     def source_name(self):
         'Name of this TargetObj in its parent directory'
-        return os.path.split(self.source_path)[1]
+        return os.path.split(self.source_path_str)[1]
+
+    @property
+    def source_path_str(self):
+        '''
+        source_path in string form
+        '''
+        return os.fsdecode(self._source_path)
+
+    def has_source_path(self):
+        '''
+        Is source_path set?
+        '''
+        return bool(self._source_path)
+
+    @property
+    def source_path_bytes(self):
+        '''
+        source_path in bytes form
+        '''
+        return self._source_path
 
     def drop_barrier(self):
         '''
@@ -1807,7 +2122,7 @@ class TargetObj():
                 'first_backpointer' : self.first_backpointer.bytes,
                 'state' : self.state,
                 'source_inode_number' : self.source_inode_number,
-                'source_path' : self.source_path,
+                'source_path_bytes' : self.source_path_bytes,
                 'reconcile_vers' : self.reconcile_vers,
                 'child_dir_count' : self.child_dir_count,
                 'pre_error_state' : self.pre_error_state,
@@ -1829,7 +2144,7 @@ class TargetObj():
               ('first_backpointer', self.first_backpointer.hex()),
               ('state', target_obj_state_name(self.state)),
               ('source_inode_number', self.source_inode_number),
-              ('source_path', self.source_path),
+              ('source_path', self.source_path_str),
               ('reconcile_vers', self.reconcile_vers),
               ('child_dir_count', self.child_dir_count),
               ('pre_error_state', target_obj_state_name(self.pre_error_state)),
@@ -1854,7 +2169,7 @@ class TargetObj():
                'first_backpointer' : self.first_backpointer.hex(),
                'state' : self.state,
                'source_inode_number' : self.source_inode_number,
-               'source_path' : self.source_path,
+               'source_path' : self.source_path_bytes.hex(),
                'reconcile_vers' : self.reconcile_vers,
                'child_dir_count' : self.child_dir_count,
                'pre_error_state' : self.pre_error_state,
@@ -1882,7 +2197,7 @@ class TargetObj():
                   first_backpointer=Filehandle.fromhex(tmp['first_backpointer']),
                   state=tmp['state'],
                   source_inode_number=tmp['source_inode_number'],
-                  source_path=tmp['source_path'],
+                  source_path=bytes.fromhex(tmp['source_path']),
                   reconcile_vers=tmp['reconcile_vers'],
                   child_dir_count=tmp['child_dir_count'],
                   pre_error_state=tmp['pre_error_state'])
@@ -1911,7 +2226,7 @@ class TargetObj():
                    first_backpointer=dbe.first_backpointer,
                    state=dbe.state,
                    source_inode_number=dbe.source_inode_number,
-                   source_path=dbe.source_path,
+                   source_path=dbe.source_path_bytes,
                    reconcile_vers=dbe.reconcile_vers,
                    child_dir_count=dbe.child_dir_count,
                    pre_error_state=dbe.pre_error_state,
@@ -1975,8 +2290,9 @@ class TargetObj():
         '''
         Return a single-line description of this object
         '''
-        if self.source_path:
-            return "%s (%s)" % (self.filehandle.hex(), self.source_path)
+        sp = self.source_path_str
+        if sp:
+            return "%s (%s)" % (self.filehandle.hex(), sp)
         return self.filehandle.hex()
 
     def existing_key(self):
@@ -2022,7 +2338,7 @@ class DbEntTargetObj(DbEntBase, DbEntCommon):
     child_dir_count = Column('child_dir_count', Integer(), index=False)
     pre_error_state = Column('pre_error_state', Integer(), index=False)
     first_backpointer = Column('first_backpointer', BINARY(length=Filehandle.fixedlen()), index=True)
-    source_path = Column('source_path', Text(), index=False)
+    source_path_bytes = Column('source_path', BINARY(), index=False)
     persisted = None # used by the DB flush code
 
     # * For getexisting, we could also add: Index('source_inode_number__ftype', 'source_inode_number', 'ftype'), # getexisting
@@ -2040,7 +2356,14 @@ class DbEntTargetObj(DbEntBase, DbEntCommon):
         return "<%s,%s,%s>" % (self.__class__.__name__, hex(id(self)), self.filehandle.hex())
 
     def __str__(self):
-        return "%s(%s,%s)" % (self.__class__.__name__, self.filehandle.hex(), self.source_path)
+        return "%s(%s,%s)" % (self.__class__.__name__, self.filehandle.hex(), self.source_path_str)
+
+    @property
+    def source_path_str(self):
+        '''
+        Return source_path in str form
+        '''
+        return os.fsdecode(self.source_path_bytes)
 
     def to_ordered_dict(self):
         'Return an OrderedDict representing the entry contents'
@@ -2058,7 +2381,7 @@ class DbEntTargetObj(DbEntBase, DbEntCommon):
               ('first_backpointer', self.first_backpointer.hex()),
               ('state', target_obj_state_name(self.state)),
               ('source_inode_number', self.source_inode_number),
-              ('source_path', self.source_path),
+              ('source_path', self.source_path_str),
               ('reconcile_vers', self.reconcile_vers),
               ('child_dir_count', self.child_dir_count),
               ('pre_error_state', target_obj_state_name(self.pre_error_state)),
@@ -2081,7 +2404,7 @@ class DbEntTargetObj(DbEntBase, DbEntCommon):
                 'first_backpointer' : self.first_backpointer,
                 'state' : self.state,
                 'source_inode_number' : self.source_inode_number,
-                'source_path' : self.source_path,
+                'source_path_bytes' : self.source_path_bytes,
                 'reconcile_vers' : self.reconcile_vers,
                 'child_dir_count' : self.child_dir_count,
                 'pre_error_state' : self.pre_error_state,
@@ -2114,7 +2437,7 @@ class DbEntTargetObj(DbEntBase, DbEntCommon):
                    first_backpointer=first_backpointer,
                    state=tobj.state,
                    source_inode_number=tobj.source_inode_number,
-                   source_path=tobj.source_path,
+                   source_path_bytes=tobj.source_path_bytes,
                    reconcile_vers=tobj.reconcile_vers,
                    child_dir_count=tobj.child_dir_count,
                    pre_error_state=tobj.pre_error_state,
@@ -2615,7 +2938,7 @@ class ReaderInfo():
     @classmethod
     def from_tobj(cls, tobj):
         'Generate an instance based on tobj (TargetObj)'
-        return cls(path=tobj.source_path,
-                   name=os.path.split(tobj.source_path)[1],
+        return cls(path=tobj.source_path_str,
+                   name=os.path.split(tobj.source_path_str)[1],
                    ftype=tobj.ftype,
                    ostat=FakeStat.from_tobj(tobj))

@@ -17,11 +17,8 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import io
+import json
 import logging
 import math
 import multiprocessing
@@ -45,20 +42,20 @@ from clfsload.pcom import PcomDirectoryWrite, PcomInit, \
                           PcomTimerUpdate, \
                           PcomTobjDone, PcomTransfer, ProcessQueues, ProcessWRock
 from clfsload.reader import ReaderPosix, ReadFilePosix
-from clfsload.types import BackpointerLimitReached, CLFS_LINK_MAX, \
-                           CLFSCompressionType, CLFSEncryptionType, CleanupStats, \
-                           CommandArgs, ContainerTerminalError, \
-                           DbEntMetaKey, DbInconsistencyError, DbTerminalError, \
-                           DryRunResult, ExistingTargetObjKey, Filehandle, \
-                           FILEHANDLE_NULL, Ftype, FinalizeStats, GenericStats, \
-                           HistoricalPerf, InitStats, NamedObjectError, \
-                           Phase, ReconcileStats, RunOptions, ServerRejectedAuthError, \
-                           SimpleError, SourceObjectError, \
-                           TargetObj, TargetObjState, TargetObjectError, \
-                           TerminalError, TimerStats, TransferStats, \
-                           WRock, WriteFileError, target_obj_state_name
+from clfsload.stypes import BackpointerLimitReached, CLFS_LINK_MAX, \
+                            CLFSCompressionType, CLFSEncryptionType, CleanupStats, \
+                            CommandArgs, ContainerTerminalError, \
+                            DbEntMetaKey, DbInconsistencyError, DbTerminalError, \
+                            DryRunResult, ExistingTargetObjKey, Filehandle, \
+                            FILEHANDLE_NULL, Ftype, FinalizeStats, GenericStats, \
+                            HistoricalPerf, InitStats, NamedObjectError, \
+                            Phase, ReconcileStats, RunOptions, ServerRejectedAuthError, \
+                            SimpleError, SourceObjectError, \
+                            TargetObj, TargetObjState, TargetObjectError, \
+                            TerminalError, TimerStats, TransferStats, \
+                            WRock, WriteFileError, target_obj_state_name
 from clfsload.util import LOG_FORMAT, Monitor, Psutil, \
-                          STRUCT_LE_U16, STRUCT_LE_U32, UINT32_MAX, \
+                          STRUCT_LE_U16, STRUCT_LE_U32, Size, UINT32_MAX, \
                           elapsed, \
                           exc_info_err, exc_info_name, exc_log, exc_stack, \
                           getframe, logger_create, notify_all
@@ -336,10 +333,10 @@ class WorkerPool():
     # How long to wait (seconds) for a child process to be ready
     WAIT_CHILD_PROCESS_READY = 5.0
 
-    def __init__(self, clfsload, num_threads, report_interval=30.0):
+    def __init__(self, clfsload, num_threads):
         self._clfsload = clfsload
         self._num_threads = num_threads
-        self._report_interval = report_interval
+        self._report_interval = 2.0 if clfsload.azcopy else 30.0
         self._report_time_next = None
         self._report_time_last = None
         self._state_lock = clfsload.db_lock
@@ -364,6 +361,13 @@ class WorkerPool():
             self._use_process = False
         self._historical_perf = None
         self.work_count = None
+        self._azcopy_pct_last = 0.0
+        try:
+            self._phase_name = self._clfsload.db.phase.azcopy_name()
+        except AttributeError:
+            self._phase_name = ''
+        self._stats_t0 = None
+        self._stats_throughput_last_time = None
 
     @property
     def db(self):
@@ -411,7 +415,8 @@ class WorkerPool():
         self.db.phase_work_poke = self._poke
         logger.debug("launch worker threads (count=%d)", self._num_threads)
         # Create but do not start the threads
-        wtss = list()
+        self._stats_t0 = time.time()
+        self._stats_throughput_last_time = self._stats_t0
         for thread_num in range(self._num_threads):
             wts = WorkerThreadState(self._clfsload.thread_shared_state,
                                     self._clfsload.logger,
@@ -420,7 +425,8 @@ class WorkerPool():
                                     thread_num,
                                     self._stats_class,
                                     self._clfsload.writer)
-            wtss.append(wts)
+            wts.stats.t0 = self._stats_t0
+            wts.stats.throughput_last_time = self._stats_t0
             self._thread_states.append(wts)
             if self._use_process:
                 wps_name = "process-%s-%s" % (self._phase, thread_num)
@@ -459,7 +465,7 @@ class WorkerPool():
         if (not self._execute_work_items) or terminate:
             # We got a terminal error earlier
             raise SystemExit(1)
-        self.work_count = sum([wts.stats.get('count_dir') + wts.stats.get('count_nondir') for wts in wtss])
+        self.work_count = sum([wts.stats.get('count_dir') + wts.stats.get('count_nondir') for wts in self._thread_states])
 
     def _run_threads(self):
         'Threads are created - do the phase work'
@@ -470,7 +476,7 @@ class WorkerPool():
         cur_ts = time.time()
         self._t0 = cur_ts
         self._report_time_next = cur_ts
-        self._report(cur_ts=cur_ts)
+        self._report(cur_ts=cur_ts, report_is_interval=True)
 
         # Start the threads
         for wts in self._thread_states:
@@ -482,8 +488,10 @@ class WorkerPool():
                 if self._aborting:
                     self._wake_all_NL()
                 log_level = None
+                report_is_interval = False
                 if (self._idle_count + self._done_count) >= self._num_threads:
-                    log_level = logging.DEBUG
+                    if (not self._clfsload.azcopy) and logger.isEnabledFor(logging.DEBUG):
+                        log_level = logging.DEBUG
                     if (not self.db.all_phase_threads_are_idle) and (not self._aborting):
                         raise AssertionError("(self._idle_count=%d + self._done_count=%d) >= self._num_threads=%d but self.db.all_phase_threads_are_idle=%s" % \
                                              (self._idle_count, self._done_count, self._num_threads, self.db.all_phase_threads_are_idle))
@@ -510,8 +518,9 @@ class WorkerPool():
                     cur_ts = time.time()
                 else:
                     log_level = logging.INFO
+                    report_is_interval = True
                 if log_level is not None:
-                    self._report(cur_ts=cur_ts, log_level=log_level)
+                    self._report(cur_ts=cur_ts, log_level=log_level, report_is_interval=report_is_interval)
 
     def _after_run_threads(self):
         '''
@@ -524,7 +533,7 @@ class WorkerPool():
         el = elapsed(self._t0, self._t1)
 
         logger.info("phase %s complete, elapsed=%f", self._phase, el)
-        stats = self._report(cur_ts=cur_ts, report_full=True, log_level=logging.DEBUG)
+        stats = self._report(cur_ts=cur_ts, report_full=True, log_level=logging.INFO, report_is_final=True)
         stats.report_final(logger, el)
         logger.debug("phase %s idle_events=%d threads=%d", self._phase, self._idle_events, len(self._thread_states))
 
@@ -578,11 +587,104 @@ class WorkerPool():
             return 0.0
         return self._report_time_next - cur_ts
 
-    def _generate_report_string(self, stats, cur_ts, elapsed_secs):
-        return "phase %s %d+%d/%d %s" % (self._phase, self._idle_count, self._done_count, self._num_threads, stats.report_short(cur_ts, elapsed_secs, self._clfsload, self._historical_perf))
+    def _do_report(self, log_level, stats, timers, cur_ts, elapsed_secs, report_is_interval=False, report_is_final=False, report_full=False):
+        '''
+        Generate and log a report. Log AzCopy info if requested.
+        Returns the report results from stats (used by tests)
+        '''
+        logger = self.logger
+        srpt = stats.report_short(cur_ts,
+                                  elapsed_secs,
+                                  self._clfsload,
+                                  self._historical_perf,
+                                  report_is_interval=report_is_interval,
+                                  report_is_final=report_is_final)
+        rs = "%s %d+%d/%d %s" % (self._phase, self._idle_count, self._done_count, self._num_threads, srpt['simple'])
+        if report_full:
+            db = self._clfsload.db
+            rs += '\n'
+            rs += '\n'.join(('stats:', stats.pformat(),
+                             'timers:', pprint.pformat(timers.elapsed_dict()),
+                             'DB stats:', db.stats.pformat(),
+                             'DB timers:', pprint.pformat(db.timers.elapsed_dict()),
+                            ))
+        # We do not drop a report for report_is_final because it
+        # is for a fraction of the interval, and the numbers will
+        # look wacky. Either the next phase will start soon, or
+        # we will finish and generate a final report.
+        if self._clfsload.azcopy and report_is_interval:
+            azcopy_rpt = self._azcopy_report(srpt)
+            if azcopy_rpt:
+                rs += '\n'
+                rs += self._clfsload.azcopy_report_interval_string(azcopy_rpt)
+        logger.log(log_level, "%s", rs)
+        return srpt
 
-    def _report(self, cur_ts=None, report_full=False, log_level=logging.INFO):
-        'Report current progress'
+    def _azcopy_report(self, srpt):
+        '''
+        Given srpt as a report dict generated by stats.report_short(),
+        return the dict for an azcopy report.
+        '''
+        # These file counts are always valid integers
+        files_completed_failed = srpt['files_completed_failed']
+        files_completed_total = srpt['files_completed_total']
+        files_completed_success = max(files_completed_total-files_completed_failed, 0) # files_skipped always 0
+
+        # This shows all attributes of the generated report for azcopy.
+        # Most of these are updated below.
+        rpt = {'elapsed' : srpt['elapsed'],
+               'files_completed_failed' : files_completed_failed,
+               'files_completed_success' : files_completed_success,
+               'files_pending' : None,
+               'files_skipped' : 0,
+               'files_total' : None,
+               'pct_complete' : None,
+               'phase' : self._phase_name,
+               'throughput_Mbps' : srpt['throughput_Mbps'],
+               'throughput_delta_secs' : srpt['throughput_delta_secs'],
+               'time_eta' : srpt['time_eta'],
+               'time_report' : srpt['time_report'],
+              }
+
+        if self._clfsload.dry_run_succeeded:
+            try:
+                rpt['pct_complete'] = self._azcopy_report__pct(min(srpt['pct_bytes'], srpt['pct_eta']))
+            except TypeError:
+                try:
+                    rpt['pct_complete'] = self._azcopy_report__pct(srpt['pct_eta'])
+                except TypeError:
+                    try:
+                        rpt['pct_complete'] = self._azcopy_report__pct(srpt['pct_bytes'])
+                    except TypeError:
+                        # Do not update self._azcopy_pct_last here.
+                        # We have no valid value here, so we would only
+                        # be discarding a valid value and risk going backwards.
+                        pass
+            try:
+                files_total = srpt['files_total']
+                rpt['files_total'] = files_total
+                files_total = max(files_total, files_completed_total)
+                rpt['files_pending'] = files_total - files_completed_total
+            except KeyError:
+                # no srpt['files_total']
+                pass
+
+        return rpt
+
+    def _azcopy_report__pct(self, pct):
+        '''
+        Given a proposed pct, return the value to use.
+        '''
+        if self._azcopy_pct_last is not None:
+            pct = max(self._azcopy_pct_last, pct)
+        pct = max(min(pct, 100.0), 0.0)
+        self._azcopy_pct_last = pct
+        return pct
+
+    def _report(self, cur_ts=None, report_full=False, log_level=logging.INFO, report_is_interval=False, report_is_final=False):
+        '''
+        Report current progress
+        '''
         logger = self.logger
         cur_ts = cur_ts if cur_ts is not None else time.time()
         self._report_time_last = cur_ts
@@ -601,20 +703,24 @@ class WorkerPool():
         # we avoid locking here and trust that the results are
         # not overly misleading.
         stats = self._stats_class()
+        stats.t0 = self._stats_t0
+        stats.throughput_last_time = self._stats_throughput_last_time
         timers = TimerStats()
         for wts in self._thread_states:
             stats.add(wts.stats, logger)
             if report_full:
                 timers.add(wts.timers, logger)
-        rs = self._generate_report_string(stats, cur_ts, elapsed_secs)
-        if report_full:
-            logger.log(log_level, "%s\nstats:\n%s\ntimers:\n%s\n%s",
-                       rs,
-                       stats.pformat(),
-                       timers.pformat(),
-                       pprint.pformat(timers.elapsed_dict()))
-        else:
-            logger.log(log_level, "%s", rs)
+        self._do_report(log_level,
+                        stats,
+                        timers,
+                        cur_ts,
+                        elapsed_secs,
+                        report_is_interval=report_is_interval,
+                        report_is_final=report_is_final,
+                        report_full=report_full)
+        # Generating the report updated stats.throughput_last_time.
+        # Save it so we can use it the next time around.
+        self._stats_throughput_last_time = stats.throughput_last_time
         return stats
 
     def _poke(self, num):
@@ -933,7 +1039,7 @@ class WorkerPool():
                 continue
             if isinstance(qi, (list, tuple)) and self._handle_qi_batch(wts, qi):
                 continue
-            elif isinstance(qi, PcomTobjDone):
+            if isinstance(qi, PcomTobjDone):
                 if tobj.filehandle != qi.tobj.filehandle:
                     # Um.
                     logger.error("%s wait_for_remote_done got filehandle %s but expected %s",
@@ -941,17 +1047,17 @@ class WorkerPool():
                     wts.process_okay = False
                     raise TargetObjectError(tobj, "filehandle mismatch from child worker", stack_is_interesting=False)
                 return qi
-            elif self._handle_qi(wts, qi):
+            if self._handle_qi(wts, qi):
                 continue
-            elif isinstance(qi, PcomSourceObjectError):
+            if isinstance(qi, PcomSourceObjectError):
                 raise SourceObjectError.from_json(qi.exception_json, stack_is_interesting=False)
-            elif isinstance(qi, PcomServerRejectedAuthError):
+            if isinstance(qi, PcomServerRejectedAuthError):
                 raise ServerRejectedAuthError.from_json(qi.exception_json, stack_is_interesting=False)
-            elif isinstance(qi, PcomTargetObjectError):
+            if isinstance(qi, PcomTargetObjectError):
                 e = TargetObjectError.from_json(qi.exception_json, stack_is_interesting=False)
                 e.update_from_tobj(tobj)
                 raise e
-            elif isinstance(qi, PcomTerminate):
+            if isinstance(qi, PcomTerminate):
                 logger.warning("%s got PcomTerminate, set process_ready=False", wts)
                 wts.process_ready = False
                 # Fall through to unexpected-message handling
@@ -1146,10 +1252,9 @@ class TransferWorkerPool(WorkerPool):
     _phase = 'transfer'
     _stats_class = TransferStats
 
-    def __init__(self, clfsload, num_threads, report_interval=30.0):
-        super(TransferWorkerPool, self).__init__(clfsload, num_threads, report_interval=report_interval)
-        db = clfsload.db
-        self._historical_perf = HistoricalPerf(db)
+    def __init__(self, clfsload, num_threads):
+        super(TransferWorkerPool, self).__init__(clfsload, num_threads)
+        self._historical_perf = HistoricalPerf(clfsload.db)
 
     def _wps_create(self, wps_name, wts):
         '''
@@ -1238,7 +1343,7 @@ class TransferWorkerPool(WorkerPool):
         Helper for _work_item_generate_dir_internal -- appends
         the bytes for one entry to stream.
         '''
-        namebytes = bytearray(name, encoding='utf-8')
+        namebytes = os.fsencode(name)
         fhbytes = filehandle.bytes
         stream.write(struct.pack(STRUCT_LE_U32, len(namebytes)))
         stream.write(namebytes)
@@ -1268,13 +1373,15 @@ class TransferWorkerPool(WorkerPool):
     # Subtract the full size of a filehandle here to provide that wiggle room
     _EFFECTIVE_DIRECTORY_FIRST_SEGMENT_LEN = CLFSSegment.FIRST_SEGMENT_BYTES - Filehandle.fixedlen()
 
+    _NAME_XLAT_ERROR = 'name translation error for child of this directory'
+
     def _work_item_generate_dir_internal(self, wts, tobj, entry_file):
         '''
         See _work_item_generate_dir().
         Returns child_dir_count.
         '''
         reader = self._clfsload.reader
-        directory = reader.opendir(tobj.source_path)
+        directory = reader.opendir(tobj.source_path_str)
         child_dir_count = 0
         segment_len = self._EFFECTIVE_DIRECTORY_FIRST_SEGMENT_LEN
         # Generate . and ..
@@ -1288,7 +1395,9 @@ class TransferWorkerPool(WorkerPool):
             pending_len += self._entry_bytes_from_namestr('..', tobj.first_backpointer, entry_file)
         assert pending_len < segment_len
         new_children = list()
+        ent_num = 0
         while True:
+            ent_num += 1
             try:
                 ri = reader.getnextfromdir(directory)
             except SourceObjectError as e:
@@ -1300,10 +1409,10 @@ class TransferWorkerPool(WorkerPool):
                 break
             namebytes = ""
             try:
-                namebytes = bytearray(ri.name, encoding='utf-8')
-            except UnicodeEncodeError as e:
-                # non-utf-8 directory entry
-                raise TargetObjectError(tobj, "utf-8 encoding error") from e
+                namebytes = os.fsencode(ri.name)
+            except Exception as e:
+                err = "%s (#%d): %s" % (self._NAME_XLAT_ERROR, ent_num, exc_info_err())
+                raise TargetObjectError(tobj, err, stack_is_interesting=False) from e
             new_entry = self._work_item_generate_target_obj_for_dir_ent(wts, tobj, ri, new_children)
             if not new_entry:
                 # Error already logged and counted
@@ -1385,7 +1494,7 @@ class TransferWorkerPool(WorkerPool):
             maybe_matching_tobjs = self.db.dbc_get_existing(wts, existing_key)
             matching_tobjs = list()
             for maybe_tobj in maybe_matching_tobjs:
-                if (not self._clfsload.preserve_hardlinks) and (maybe_tobj.source_path != entry.path):
+                if (not self._clfsload.preserve_hardlinks) and (maybe_tobj.source_path_str != entry.path):
                     continue
                 if maybe_tobj.ftype == Ftype.DIR:
                     assert tobj.ic_restored_in_progress
@@ -1436,7 +1545,7 @@ class TransferWorkerPool(WorkerPool):
                         logger.warning("%s source '%s' inode=%s ftype=%s already found at max link count %d, treating as unique with nlink=%d",
                                        wts, entry.path, entry.ostat.st_ino, entry.ftype, CLFS_LINK_MAX, nlink)
                     else:
-                        matching_names = [ntobj.source_path for ntobj in matching_tobjs]
+                        matching_names = [ntobj.source_path_str for ntobj in matching_tobjs]
                         logger.warning("%s source '%s' inode=%s ftype=%s has multiple possible matches, treating as possibly-unique with nlink=%d matching_names:\n%s",
                                        wts, entry.path, entry.ostat.st_ino, entry.ftype, nlink, pprint.pformat(matching_names))
                 elif matching_tobjs:
@@ -1674,25 +1783,20 @@ class CLFSLoadResult():
 class CLFSLoad():
     def __init__(self, command_args, logger,
                  create_local_state_dir=None,
-                 db_class=None,
-                 writer_class=None,
-                 reader_class=None,
-                 readfile_local_class=None,
-                 dry_run_helper_class=None,
-                 transfer_worker_pool_class=None,
-                 reconcile_worker_pool_class=None,
-                 cleanup_worker_pool_class=None,
-                 db_preclaim_state_class=None,
                  retry_errors=None,
                  logfile_enable=True,
                  subprocess_enable=True,
-                 transfer_pool_enable=True):
+                 transfer_pool_enable=True,
+                 **kwargs):
         '''
         command_args: CommandArgs object encapsulating command-line arguments for this run
         logger: Default logger created by the front-end.
         create_local_state_dir: Whether the local_state_dir should be created or assumed to exist. None=rely on command-line args.
+        db_class: Class to use for database actions
         writer_class: Class to use when writing CLFS
         reader_class: Class to use when reading the source
+        readfile_local_class: Class to use for reading local files (.entries files)
+        dry_run_helper_class: Passed to the dry_run reader
         transfer_worker_pool_class: Class to use for the transfer phase; TransferWorkerPool or a subclass
         reconcile_worker_pool_class: Class to use for the reconcile phase; ReconcileWorkerPool or a subclass
         cleanup_worker_pool_class: Class to use for the cleanup phase; CleanupWorkerPool or a subclass
@@ -1707,19 +1811,21 @@ class CLFSLoad():
         self._logger = logger
         self.check_python_version()
         self._create_local_state_dir = create_local_state_dir if create_local_state_dir is not None else self._command_args.new
-        db_class = db_class if db_class is not None else ClfsLoadDB
-        self._writer_class = writer_class if writer_class is not None else WriterAzure
-        self._reader_class = None
+
+        self._db_class = kwargs.pop('db_class', self._db_class)
+        self._writer_class = kwargs.pop('writer_class', self._writer_class)
+        self._reader_class = kwargs.pop('reader_class', self._reader_class)
+        self._readfile_local_class = kwargs.pop('readfile_local_class', self._readfile_local_class)
+        self._dry_run_helper_class = kwargs.pop('dry_run_helper_class', self._dry_run_helper_class)
+        self._transfer_worker_pool_class = kwargs.pop('transfer_worker_pool_class', self._transfer_worker_pool_class)
+        self._reconcile_worker_pool_class = kwargs.pop('reconcile_worker_pool_class', self._reconcile_worker_pool_class)
+        self._cleanup_worker_pool_class = kwargs.pop('cleanup_worker_pool_class', self._cleanup_worker_pool_class)
+        self._db_preclaim_state_class = kwargs.pop('db_preclaim_state_class', self._db_preclaim_state_class)
+
         self._source_root_path = self._command_args.source_root
-        if self._source_root_path:
-            self._reader_class = reader_class if reader_class is not None else ReaderPosix
-        self._readfile_local_class = readfile_local_class if readfile_local_class is not None else ReadFilePosix
-        self._dry_run_helper_class = dry_run_helper_class
-        self._transfer_worker_pool_class = transfer_worker_pool_class if transfer_worker_pool_class is not None else TransferWorkerPool
-        self._reconcile_worker_pool_class = reconcile_worker_pool_class if reconcile_worker_pool_class is not None else ReconcileWorkerPool
-        self._cleanup_worker_pool_class = cleanup_worker_pool_class if cleanup_worker_pool_class is not None else CleanupWorkerPool
         self._retry_errors = retry_errors if retry_errors is not None else self._command_args.retry_errors
         self._subprocess_enable = subprocess_enable
+        self._azcopy = command_args.azcopy
 
         self._run_options = RunOptions()
         self._run_options.transfer_pool_enable = self._subprocess_enable and transfer_pool_enable
@@ -1761,12 +1867,12 @@ class CLFSLoad():
         self._global_stats = GenericStats()
 
         self._file_cleaner = FileCleaner(self._thread_shared_state, self._logger)
-        self._db = db_class(self._thread_shared_state,
-                            self.local_state_path,
-                            logger,
-                            self._file_cleaner,
-                            toc_lock=self._db_lock,
-                            db_preclaim_state_class=db_preclaim_state_class)
+        self._db = self._db_class(self._thread_shared_state,
+                                  self.local_state_path,
+                                  logger,
+                                  self._file_cleaner,
+                                  toc_lock=self._db_lock,
+                                  db_preclaim_state_class=self._db_preclaim_state_class)
 
         if self._source_root_path:
             self._reader = self._reader_class(self._command_args, logger, self._run_options, self._source_root_path)
@@ -1803,6 +1909,21 @@ class CLFSLoad():
         self.transfer_count = None
         self.reconcile_count = None
         self.cleanup_count = None
+
+        if kwargs:
+            raise TypeError("unexpected kwargs: %s" % sorted(kwargs.keys()))
+
+    # Default classes. May be overloaded in testing subclasses
+    # or as kwargs to the constructor.
+    _db_class = ClfsLoadDB
+    _writer_class = WriterAzure
+    _reader_class = ReaderPosix
+    _readfile_local_class = ReadFilePosix
+    _dry_run_helper_class = None
+    _transfer_worker_pool_class = TransferWorkerPool
+    _reconcile_worker_pool_class = ReconcileWorkerPool
+    _cleanup_worker_pool_class = CleanupWorkerPool
+    _db_preclaim_state_class = None
 
     def __del__(self):
         self._close_logfile()
@@ -1948,6 +2069,11 @@ class CLFSLoad():
     def global_stats(self):
         'accessor'
         return self._global_stats
+
+    @property
+    def azcopy(self):
+        'accessor'
+        return self._azcopy
 
     def check_python_version(self):
         '''
@@ -2298,11 +2424,13 @@ class CLFSLoad():
         exc_info = None
         t0 = time.time()
         constructed = False
+        final_job_status = ''
         try:
             clfsloadobj = cls(command_args, logger, **clfsload_kwargs)
             constructed = True
             exit_status = proc(clfsloadobj, *proc_args, **proc_kwargs)
         except KeyboardInterrupt:
+            final_job_status = 'Aborted'
             exc_info = sys.exc_info()[:2]
             logger.warning("KeyboardInterrupt %s", getframe(0))
         except SystemExit as e:
@@ -2337,12 +2465,20 @@ class CLFSLoad():
                 logger.error("See %s for more information.", SAS_DOC_URL)
             else:
                 logger.error("%s %s stack:\n%s\n%s error: %s %s", action, ecn, exc_stack(), action, ecn, estr)
+        if exit_status == 0:
+            final_job_status = 'Completed'
+        final_job_status = final_job_status or 'Failed'
         if clfsloadobj is not None:
             clfsloadobj.should_run = False
             if clfsloadobj.db:
                 clfsloadobj.db.threads_stop(stop_only=True)
             clfsloadobj.file_cleaner_discard()
-        t1 = time.time()
+            t1 = time.time()
+            if clfsloadobj.azcopy:
+                clfsloadobj.azcopy_do_report_final(elapsed(t0, t1), final_job_status)
+        else:
+            t1 = time.time()
+
         result = CLFSLoadResult(clfsloadobj, exit_status, exc_info, t0, t1)
         if result.server_rejected_auth:
             logger.error("The server rejected authentication. Check your sas_token and try again.")
@@ -2574,7 +2710,7 @@ class CLFSLoad():
         This is invoked on each TargetObj in the ERROR state during _phase_finalize().
         Write the source file path to the problem file using problem_writer.
         '''
-        problem_writer.write(bytes(tobj.source_path, encoding='utf_8'))
+        problem_writer.write(tobj.source_path_bytes)
         problem_writer.write(b"\n")
         return False
 
@@ -2623,8 +2759,9 @@ class CLFSLoad():
         ret = self._phase_finalize__write_problems()
         self._log_file_flush()
         root_tobj = self.root_tobj_get()
+        logfile_names = sorted([logfile for logfile in os.listdir(self.local_state_path) if logfile.endswith('.txt')])
         try:
-            self.writer.finalize(wrock, self._target_root_filehandle, root_tobj, self.local_state_path)
+            self.writer.finalize(wrock, self._target_root_filehandle, root_tobj, self.local_state_path, logfile_names)
         except (KeyboardInterrupt, SystemExit, TerminalError, WriteFileError):
             raise
         except BaseException as e:
@@ -2641,9 +2778,61 @@ class CLFSLoad():
         '''
         return self.db.db_tobj_get(self._target_root_filehandle)
 
+    def azcopy_do_report_final(self, time_elapsed, final_job_status):
+        '''
+        Generate and log the final azcopy report.
+        Called from run_wrapped(). Call this exactly once per azcopy run.
+        '''
+        time_elapsed = float(time_elapsed)
+        final_job_status = str(final_job_status)
+        try:
+            total = self.db.db_count_all()
+        except:
+            total = None
+        try:
+            done = int(self.db.db_count_in_state(TargetObjState.DONE))
+        except:
+            done = None
+        try:
+            failed = int(self.db.db_count_in_state(TargetObjState.ERROR))
+        except:
+            failed = None
+        try:
+            progress = self.db.db_get_progress()
+            total_bytes_transferred = int(progress.dr_gb * Size.GB)
+        except:
+            total_bytes_transferred = None
+        rpt = {'elapsed' : time_elapsed,
+               'files_completed_success' : done,
+               'files_completed_failed' : failed,
+               'files_skipped' : 0,
+               'files_total' : total,
+               'final_job_status' : str(final_job_status),
+               'total_bytes_transferred' : total_bytes_transferred,
+              }
+        self.logger.info("azcopy:\n%s", self.azcopy_report_final_string(rpt))
+
+    @staticmethod
+    def azcopy_report_interval_string(azcopy_rpt):
+        '''
+        Given a report in dict form (azcopy_rpt), generate the output string for azcopy.
+        The caller is expected to log this on a line by itself,
+        followed by a newline.
+        '''
+        return 'AZCOPY:' + json.dumps(azcopy_rpt, separators=(',', ':'), check_circular=False)
+
+    @staticmethod
+    def azcopy_report_final_string(azcopy_rpt):
+        '''
+        Given a report in dict form (azcopy_rpt), generate the output string for azcopy.
+        The caller is expected to log this on a line by itself,
+        followed by a newline.
+        '''
+        return 'AZCOPY-FINAL:' + json.dumps(azcopy_rpt, separators=(',', ':'), check_circular=False)
+
 def main(*args):
     logger = logger_create(logging.INFO)
-    command_args = CommandArgs(logger)
+    command_args = CommandArgs(logger, prog='CLFSLoad', add_version=True)
     command_args.parse(*args)
     clfsload_kwargs = dict()
     CLFSLoad.run_wrapped(command_args, logger, CLFSLoad.run, clfsload_kwargs=clfsload_kwargs)

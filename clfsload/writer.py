@@ -16,12 +16,9 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 
-from __future__ import absolute_import
-from __future__ import print_function
-
 import os
 
-from clfsload.types import NamedObjectError, ReaderWriterBase, TargetObjectError, TerminalError, WriteFileError
+from clfsload.stypes import NamedObjectError, ReaderWriterBase, TargetObjectError, TerminalError, WriteFileError
 from clfsload.util import Size, exc_info_err, exc_stack
 
 class WriteFileBase():
@@ -255,11 +252,13 @@ class Writer(ReaderWriterBase):
         '''
         # Nothing to do here in the base class
 
-    def finalize(self, wrock, root_fh, root_tobj, logfile_dir):
+    def finalize(self, wrock, root_fh, root_tobj, logfile_dir, logfile_names):
         '''
         Do the work of the finalize phase.
+        Save log files, write the root directory inode.
         root_fh, root_tobj : root dir fh/targetobj
         logfile_dir : directory containing log files
+        logfile_names : names of logfiles in logfile_dir
         '''
         # Nothing to do here in the base class
 

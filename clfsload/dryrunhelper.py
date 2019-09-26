@@ -19,14 +19,11 @@
 DryRunHelper is a class for performing a generic dry run using a Reader
 '''
 
-from __future__ import absolute_import
-from __future__ import division
-
 import collections
 import logging
 import threading
 
-from clfsload.types import CLFS_LINK_MAX, DryRunResult, Ftype, ReaderInfo, SimpleError
+from clfsload.stypes import CLFS_LINK_MAX, DryRunResult, Ftype, ReaderInfo, SimpleError
 from clfsload.util import Size, exc_info_err, exc_log, getframe
 
 class _ThreadState():

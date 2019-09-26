@@ -43,7 +43,8 @@ This example creates a Python virtual environment and installs CLFSLoad:
 python3 -m venv $HOME/CLFSLoad < /dev/null
 source $HOME/CLFSLoad/bin/activate
 easy_install -U setuptools < /dev/null
-python setup.py install
+python -B gen_setup.py
+python -B setup.py install
 ```
 
 This example creates a ``/CLFSLoad`` subdirectory in the user's HOME and
@@ -98,6 +99,24 @@ start it, but without the ``--new`` argument.
 ```bash
 CLFSLoad.py local_state_path source_root target_storage_account target_container sas_token
 ```
+
+### Important command-line options:
+
+* *```compression``` Set this to LZ4 to enable compressing blob contents
+  using LZ4. Set this to DISABLED to prevent blob content compression.
+  Compressing blob contents reduces the capacity consumed by the
+  target container and reduces network consumption while using the
+  container when it is used at the cost of additional CPU cycles.
+  Enabling LZ4 compression is recommended for most workloads.
+
+* *```preserve_hardlinks``` When this is not enabled, an entity linked
+  in the namespace more than once is transferred separately for each
+  time it is found, and there is no relationship between these entities
+  in the generated target container. When this is enabled, CLFSLoad
+  utilizes inode number (```st_ino```) to infer identity relationships
+  between entities with a link count (```st_nlink```) greater than one.
+  Do not use this option if your source filesystem does not provide
+  unique inode numbers for each unique entity.
 
 ### Running on Azure virtual machines
 

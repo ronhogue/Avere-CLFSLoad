@@ -1,5 +1,5 @@
 #
-# setup.py
+# setup.py.tmpl
 #
 #-------------------------------------------------------------------------
 # Copyright (c) Microsoft.  All rights reserved.
@@ -16,26 +16,25 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 
-from __future__ import absolute_import
-
 import importlib
 import logging
+import os
 import setuptools
+
+requirements = [
+               ]
 
 def doit():
     logging.basicConfig(level=logging.WARNING)
 
-    spec = importlib.util.spec_from_file_location('types', 'clfsload/version.py')
+    try:
+        os.chdir(os.path.abspath(os.path.split(__file__)[0]))
+    except Exception:
+        pass
+    location = os.path.join('clfsload', 'version.py')
+    spec = importlib.util.spec_from_file_location('clfsload.version', location)
     version = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(version)
-
-    requirements = list()
-    with open("requirements.txt", "r") as f:
-        for line in f.readlines():
-            line = line.strip()
-            if (not line) or line.startswith('#'):
-                continue
-            requirements.append(line)
 
     desc_short = 'Avere CLFSLoad ingest Python library and CLFSLoad.py command line utility'
 
@@ -61,6 +60,7 @@ def doit():
                      name='clfsload',
                      packages=['clfsload'],
                      python_requires='~=3.6',
-                     version=version.VERSION_STRING)
+                     version=version.VERSION_STRING,
+                    )
 
 doit()

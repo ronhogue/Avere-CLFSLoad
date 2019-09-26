@@ -16,14 +16,10 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import io
 import struct
 
-from clfsload.types import Btype, Filehandle, OBJ_VERSION_INITIAL, ObCacheId
+from clfsload.stypes import Btype, Filehandle, OBJ_VERSION_INITIAL, ObCacheId
 from clfsload.util import NSEC_PER_SEC_FLOAT, STRUCT_LE_U32
 
 def time_secs_nsecs(mtime):

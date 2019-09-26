@@ -16,14 +16,12 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 
-from __future__ import absolute_import
-from __future__ import print_function
-
 import collections
 import datetime
 import logging
 import os
 import pprint
+import shutil
 import signal
 import sys
 import threading
@@ -31,6 +29,7 @@ import time
 import traceback
 
 import psutil
+import tabulate
 
 NSEC_PER_SEC_INT = 1000000000
 NSEC_PER_SEC_FLOAT = float(NSEC_PER_SEC_INT)
@@ -272,7 +271,6 @@ def remove_path(path):
     '''
     Remove the target path
     '''
-    import shutil
     if os.path.isdir(path) and (not os.path.islink(path)):
         shutil.rmtree(path)
     else:
@@ -362,7 +360,6 @@ class Psutil():
         there are no children found then no more will
         appear.
         '''
-        from tabulate import tabulate
         tup = cls.get_child_pids()
         if not tup[0]:
             if log_if_no_children:
@@ -375,7 +372,7 @@ class Psutil():
             count += 1
             logger.debug("cleanup_children: found these processes to kill on pass %d\n%s",
                          count,
-                         tabulate(tup[1], headers='firstrow'))
+                         tabulate.tabulate(tup[1], headers='firstrow'))
             for pid in tup[0]:
                 try:
                     os.kill(pid, int(cls.SIGKILL))

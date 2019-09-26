@@ -16,26 +16,22 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 
-from __future__ import absolute_import
-from __future__ import division
-
 import collections
 import io
 import logging
 import os
 import struct
-import time
 import uuid
 
 import lz4.frame
 
 from clfsload.clfsutils import fnv1_hash, generate_bucket_name, hash64, time_secs_nsecs
-from clfsload.types import Btype, CLFSCommonObjectId, CLFSCompressionType, \
-                           CLFSEncryptionType, CLFSObjHandleType, CLFSObjectBlob, \
-                           DEVICE_FTYPES, FILEHANDLE_NULL, FILEHANDLE_ORPHAN, FILEHANDLE_ROOT, \
-                           Filehandle, Ftype, HandleBase, NamedObjectError, ObCacheId, \
-                           SimpleError, TargetObj, TargetObjState, TargetObjectError, \
-                           TerminalError
+from clfsload.stypes import Btype, CLFSCommonObjectId, CLFSCompressionType, \
+                            CLFSEncryptionType, CLFSObjHandleType, CLFSObjectBlob, \
+                            DEVICE_FTYPES, FILEHANDLE_NULL, FILEHANDLE_ORPHAN, FILEHANDLE_ROOT, \
+                            Filehandle, Ftype, HandleBase, NamedObjectError, ObCacheId, \
+                            SimpleError, TargetObj, TargetObjState, TargetObjectError, \
+                            TerminalError
 from clfsload.util import STRUCT_LE_U16, STRUCT_LE_U32, exc_info_err, exc_log
 
 UUID_LEN = 16
@@ -152,27 +148,20 @@ def unparse_attr(run_options, ba, tObj):
                           0, # ignored by dirmgr during populate
                           run_options.containerid))
 
-def get_byte_count_extattrs(attrdict):
-    '''
-    Extended attributes are a dictionary of str -> str
-    (key, value) tuples
-    '''
-    size = 4 # number of attrs
-    for key, value in attrdict.items():
-        size += 4 + len(bytes(key, 'utf-8'))
-        size += 4 + len(bytes(value, 'utf-8'))
-    return size
-
 def unparse_buf(ba, buffer):
     ba.extend(struct.pack(STRUCT_LE_U32, len(buffer)))
     ba.extend(buffer)
 
-def unparse_extattrs(ba, attrdict):
+def unparse_extattrs(attrdict):
+    '''
+    Return bytearray for CLFSObjHandleType.OBTYPE_EXTATTRS
+    '''
     numattrs = len(attrdict)
-    ba.extend(struct.pack(STRUCT_LE_U32, numattrs))
+    ba = bytearray(struct.pack(STRUCT_LE_U32, numattrs))
     for key, value in attrdict.items():
         unparse_buf(ba, bytes(key, 'utf-8'))
         unparse_buf(ba, bytes(value, 'utf-8'))
+    return ba
 
 def get_byte_count_data(dataBa):
     '''
@@ -185,23 +174,14 @@ def unparse_data(ba, data):
     ba.extend(struct.pack(STRUCT_LE_U32, len(data)))
     ba.extend(data)
 
-def get_byte_count_dirents_list(direntList):
-    'compute bytes required for on-disk representation of dirents'
-    count = 0
-    for dirent in direntList:
-        # 6 = 4 for length of dirent[0], 2 for length of dirent[1]
-        count += 6
-        if isinstance(dirent[0], str):
-            dirent[0] = bytes(dirent[0], 'utf-8')
-        count += len(dirent[0])
-        count += len(dirent[1])
-    return count
-
-def unparse_dirents_list(ba, direntList):
-    'unparse entries in dirent list into ba'
+def unparse_dirents_list(direntList):
+    '''
+    Return bytearray for CLFSObjHandleType.OBTYPE_DIRENTS
+    '''
+    ba = bytearray()
     for dirent in direntList:
         if isinstance(dirent[0], str):
-            n = bytes(dirent[0], 'utf-8')
+            n = os.fsencode(dirent[0])
         else:
             n = dirent[0]
         ba.extend(struct.pack('<I%ds' % (len(n),), len(n), n))
@@ -211,26 +191,27 @@ def unparse_dirents_list(ba, direntList):
             assert isinstance(dirent[1], (bytes, bytearray))
             fhbytes = dirent[1]
         ba.extend(struct.pack('<H%ds' % (len(fhbytes,)), len(fhbytes), fhbytes))
+    return ba
 
 def get_byte_count_back(backPtrFileHandleList):
-    _count = 4  # size of back pointer list
+    # 4: length of the backpointer list
+    # 2: length of each backpointer
+    count = 4 + (2 * len(backPtrFileHandleList))
     for backFh in backPtrFileHandleList:
-        _count += 2 + len(backFh) # size of fh + 2
-    return _count
+        count += len(backFh)
+    return count
 
 def unparse_back(ba, backFhList):
     ba.extend(struct.pack(STRUCT_LE_U32, len(backFhList)))
     for backFh in  backFhList:
         ba.extend(struct.pack('<H%ds' % (len(backFh),), len(backFh), backFh.bytes))
 
-def get_byte_count_name(nameStr):
-    'Name blob -- name blob in cloud file/dir inode object'
-    return 4 + len(nameStr.encode('utf-8'))
-
-def unparse_name(ba, nameStr):
-    nameba = str.encode(nameStr, "UTF-8")
-    ba.extend(struct.pack(STRUCT_LE_U32, len(nameba)))
-    ba.extend(nameba)
+def unparse_name(nameStr):
+    '''
+    Return bytes for CLFSObjHandleType.OBTYPE_NAME
+    '''
+    nameba = os.fsencode(nameStr)
+    return struct.pack(STRUCT_LE_U32, len(nameba)) + nameba
 
 def get_byte_count_databack(ownerfh):
     '''
@@ -239,11 +220,10 @@ def get_byte_count_databack(ownerfh):
     '''
     return 4 + 8 + (2 + len(ownerfh))
 
-_UNPARSE_DATABACK_PACK1 = "<IQ"
 def unparse_databack(ba, ctime, blockOffset, ownerfh):
     if isinstance(ownerfh, HandleBase):
         ownerfh = ownerfh.bytes
-    ba.extend(struct.pack(_UNPARSE_DATABACK_PACK1, ctime, blockOffset))
+    ba.extend(struct.pack('<IQ', ctime, blockOffset))
     ba.extend(struct.pack("<H%ds" % (len(ownerfh),), len(ownerfh), ownerfh))
 
 def get_byte_count_bmap(directBlockList, indirectBlockList):
@@ -282,7 +262,7 @@ def get_byte_count_indir(indirectBlockList):
     We assume all indirect block pointers (including null blocks) are passed as input to parse/getByteCount
     count of block pointers (4 bytes) and (4 byte length + filehandle bytearray) for each block id
     '''
-    return 4 + (len(indirectBlockList) * (2 + len(uuid.uuid4().bytes)))
+    return 4 + (len(indirectBlockList) * (2 + UUID_LEN))
 
 def unparse_indir(ba, indirectBlockList):
     blockIdLen = len(uuid.uuid4().bytes)
@@ -464,15 +444,16 @@ def unparse_obj_handles(run_options,
     '''
 
     for objHandleType in objBtypeList:
+        obdata = None
         if objHandleType == CLFSObjHandleType.OBTYPE_DATA:
             realCount = get_byte_count_data(dataBa)
         elif objHandleType == CLFSObjHandleType.OBTYPE_DIRENTS:
-            if direntList:
-                realCount = get_byte_count_dirents_list(direntList)
-            elif direntDataBa is not None:
-                realCount = len(direntDataBa)
+            if direntDataBa is not None:
+                obdata = direntDataBa
             else:
-                raise TargetObjectError(tobj, "no direntList or direntDataBa for OBTYPE_DIRENTS (internal error)")
+                assert direntList
+                obdata = unparse_dirents_list(direntList)
+            realCount = len(obdata)
         elif objHandleType == CLFSObjHandleType.OBTYPE_VATTR:
             realCount = get_byte_count_attr()
         elif objHandleType == CLFSObjHandleType.OBTYPE_BMAP:
@@ -486,9 +467,11 @@ def unparse_obj_handles(run_options,
         elif objHandleType == CLFSObjHandleType.OBTYPE_DATABACK:
             realCount = get_byte_count_databack(ownerFh)
         elif objHandleType == CLFSObjHandleType.OBTYPE_EXTATTRS:
-            realCount = get_byte_count_extattrs(extattrDict)
+            obdata = unparse_extattrs(extattrDict)
+            realCount = len(obdata)
         elif objHandleType == CLFSObjHandleType.OBTYPE_NAME:
-            realCount = get_byte_count_name(targetName)
+            obdata = unparse_name(targetName)
+            realCount = len(obdata)
         else:
             raise TargetObjectError(tobj, "blob byteCount not implemented for objHandleType %s %s" % (objHandleType.__class__.__name__, objHandleType))
 
@@ -499,12 +482,6 @@ def unparse_obj_handles(run_options,
 
         if objHandleType == CLFSObjHandleType.OBTYPE_DATA:
             unparse_data(ba, dataBa)
-        elif objHandleType == CLFSObjHandleType.OBTYPE_DIRENTS:
-            if direntList:
-                unparse_dirents_list(ba, direntList)
-            else:
-                # we verfied above that we have either direntList or direntDataBa
-                ba.extend(direntDataBa)
         elif objHandleType == CLFSObjHandleType.OBTYPE_VATTR:
             unparse_attr(run_options, ba, targetObj)
         elif objHandleType == CLFSObjHandleType.OBTYPE_BMAP:
@@ -519,13 +496,9 @@ def unparse_obj_handles(run_options,
         elif objHandleType == CLFSObjHandleType.OBTYPE_BACK:
             unparse_back(ba, backPointerList)
         elif objHandleType == CLFSObjHandleType.OBTYPE_DATABACK:
-            unparse_databack(ba, int(time.time()), dataOffset, ownerFh)
-        elif objHandleType == CLFSObjHandleType.OBTYPE_EXTATTRS:
-            unparse_extattrs(ba, extattrDict)
-        elif objHandleType == CLFSObjHandleType.OBTYPE_NAME:
-            unparse_name(ba, targetName)
+            unparse_databack(ba, int(tobj.ctime), dataOffset, ownerFh)
         else:
-            raise TargetObjectError(tobj, "blob unparse not implemented for objHandleType %s %s" % (objHandleType.__class__.__name__, objHandleType))
+            ba.extend(obdata)
 
         if padding > 0:
             ba.extend(bytes(padding))
@@ -582,12 +555,19 @@ class ParseState():
         length = struct.unpack(STRUCT_LE_U32, self._read(4))[0]
         return self._read(length)
 
-    def _read_name(self, *args):
+    def _read_name(self):
         '''
         Read and decode a name
         '''
         name = self._read_with_length32()
-        return name.decode(*args)
+        return os.fsdecode(name)
+
+    def _read_utf8name(self):
+        '''
+        Read and decode a name
+        '''
+        name = self._read_with_length32()
+        return name.decode(encoding='utf-8')
 
     def _parse_header(self):
         '''
@@ -689,18 +669,18 @@ class ParseState():
         '''
         numattrs = struct.unpack(STRUCT_LE_U32, self._read(4))[0]
         # Logically, it seems like this could be:
-        #    attrdict = {self._read_name('UTF-8') : self._read_name('UTF-8') for _ in range(numattrs)}
+        #    attrdict = {self._read_utf8name() : self._read_utf8name() for _ in range(numattrs)}
         # That will not work, however, because Python fills the
         # value before the key.
         attrdict = dict()
         for _ in range(numattrs):
-            key = self._read_name('UTF-8')
-            value = self._read_name('UTF-8')
+            key = self._read_utf8name()
+            value = self._read_utf8name()
             attrdict[key] = value
         self.parseDict['ExtAttrs'] = attrdict
 
     def _parse_name(self):
-        self.parseDict['Name'] = self._read_name('UTF-8')
+        self.parseDict['Name'] = self._read_name()
 
     def parse(self):
         '''
@@ -1094,8 +1074,7 @@ def _obj_reconcile__repack_dirents(wrock, tobj, oblob, blob_name):
             dotdot[1] = FILEHANDLE_ORPHAN
     else:
         dotdot[1] = tobj.first_backpointer
-    ba = bytearray()
-    unparse_dirents_list(ba, dirent_list)
+    ba = unparse_dirents_list(dirent_list)
     assert len(ba) <= CLFSSegment.FIRST_SEGMENT_BYTES
     return ba, dotdot[1]
 

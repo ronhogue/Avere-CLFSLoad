@@ -23,10 +23,6 @@ is free to assume that any object with nlink=1 during the transfer
 phase will never legitimately gain extra links.
 '''
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import collections
 import enum
 import json
@@ -43,14 +39,14 @@ from sqlalchemy.engine import Engine
 from sqlalchemy.orm.query import Query
 from sqlalchemy.orm.session import Session
 
-from clfsload.types import AbortException, AdditionalBackpointers, BackpointerLimitReached, \
-                           CLFS_LINK_MAX, DATA_FTYPES, \
-                           DbEntBase, DbEntAdditionalBackpointerMapEnt, DbEntMeta, DbEntTargetObj, \
-                           DBStats, DbEntMetaKey, DbInconsistencyError, DbTerminalError,\
-                           DryRunResult, ExistingTargetObjKeyBarrier, \
-                           FILEHANDLE_NULL_BYTES, Filehandle, Ftype, Phase, \
-                           SimpleError, TargetObjState, \
-                           TerminalError, TargetObj, TimerStats
+from clfsload.stypes import AbortException, AdditionalBackpointers, BackpointerLimitReached, \
+                            CLFS_LINK_MAX, DATA_FTYPES, \
+                            DbEntBase, DbEntAdditionalBackpointerMapEnt, DbEntMeta, DbEntTargetObj, \
+                            DBStats, DbEntMetaKey, DbInconsistencyError, DbTerminalError,\
+                            DryRunResult, ExistingTargetObjKeyBarrier, \
+                            FILEHANDLE_NULL_BYTES, Filehandle, Ftype, Phase, \
+                            SimpleError, TargetObjState, \
+                            TerminalError, TargetObj, TimerStats
 from clfsload.util import Monitor, Size, elapsed, exc_info_err, exc_log, exc_stack, getframe, notify_all
 
 _CACHE_SIZE = Size.GB
@@ -172,8 +168,9 @@ class ClfsLoadDB():
         self._all_phase_threads_are_idle = False
         self._any_phase_threads_are_idle = False
 
-        self.timers = TimerStats()
-        self.stats = DBStats(lock=self.toc_lock)
+        self.timers = None
+        self.stats = None
+        self._stats_reset()
 
         self.query_DbEntMeta = Query((DbEntMeta,))
         self.query_DbEntTargetObj = Query((DbEntTargetObj,))
@@ -253,6 +250,8 @@ class ClfsLoadDB():
             prev_phase = self._phase
             if prev_phase != value:
                 self.toc_idx_flushed_and_work_remaining_last = 0
+                self._stats_reset()
+                self.stats.stat_set('error_count_entity', self.db_count_in_state(TargetObjState.ERROR))
                 ret = True
             self.check_usable()
             if self.toc_flushing is not None:
@@ -342,20 +341,38 @@ class ClfsLoadDB():
                     self._logger.error("%s DB terminal_error is now '%s'" % (self, self._terminal_error))
         self._best_effort_wake_all()
 
-    def toc_queue_len(self):
+    def _stats_reset(self):
         '''
-        Return the number of flushes logically pending.
-        This is intended as a user-facing (debugging) number in stats
-        reporting.
+        Reset stats and timers.
+        '''
+        self.timers = TimerStats()
+        self.timers.start_working()
+        self.stats = DBStats(lock=self.toc_lock)
+
+    def toc_queue_est(self, snap=False):
+        '''
+        Return a tuple of:
+          number of flushes logically pending
+          estimated time required to perform those flushes.
         '''
         with self.toc_lock:
-            ret = 0
+            qlen = 0
             if self.toc_buffering:
-                ret += 1
-            ret += len(self.toc_flush_list)
+                qlen += 1
+            qlen += len(self.toc_flush_list)
             if self.toc_flushing is not None:
-                ret += 1
-            return ret
+                qlen += 1
+            stats = self.stats
+            if snap:
+                stats.stat_snap_flush_NL()
+            count1 = stats.get('snap1_flush_count')
+            seconds1 = stats.get('snap1_flush_seconds')
+            count2 = stats.get('snap2_flush_count')
+            seconds2 = stats.get('snap2_flush_seconds')
+            count = (2 * count1) + count2
+            seconds = (2 * seconds1) + seconds2
+            mean = (seconds / count) if count else 0.5
+            return (qlen, mean*qlen)
 
     def toc_thread_start(self):
         'launch toc thread only'
@@ -384,7 +401,6 @@ class ClfsLoadDB():
             return
         for threadstate in self._bkg_threadstates:
             threadstate.wait_for_stopped(self)
-        self._logger.debug("DB timers:\n%s\nstats:\n%s", self.timers.pformat(), self.stats.pformat())
 
     @staticmethod
     def version_format_get():
@@ -452,6 +468,18 @@ class ClfsLoadDB():
     def db_any_in_state(self, state):
         'Return whether there are any target objects in the given state'
         return bool(self.db_count_in_state(state, limit=1))
+
+    def db_count_all(self):
+        '''
+        Return the total number of rows in the target obj db.
+        May be done even with the DB in a terminal state.
+        '''
+        session = self.dbtobj.session_get()
+        try:
+            query = self.query_DbEntTargetObj.with_session(session)
+            return query.count()
+        finally:
+            self.dbtobj.session_release(session)
 
     def db_count_in_state(self, state, limit=0):
         'Return the number of items in the given state'
@@ -1001,6 +1029,7 @@ class ClfsLoadDB():
                     db.toc_preclaim.preclaim_add_pend_writing_data(TargetObj.from_dbe(dbe))
             if (dbe.state == TargetObjState.ERROR) and (prev_state != TargetObjState.ERROR):
                 dbe.pre_error_state = prev_state
+                db.stats.stat_inc('error_count_entity')
             return self._flush__update_state_pre_reap(db, query, dbe)
 
         def _flush__update_state_pre_reap(self, db, query, dbe):
@@ -1038,15 +1067,20 @@ class ClfsLoadDB():
 
         def flush(self, db, session):
             'Write all pending updates in a single transaction'
-            with db.timers.start('flush'):
+            with db.timers.start('flush') as timer:
                 self._flush(db, session)
+                timer.stop()
+                db.stats.stat_update({'flush_count' : 1,
+                                      'flush_seconds' : timer.elapsed(),
+                                      'snap0_flush_count' : 1,
+                                      'snap0_flush_seconds' : timer.elapsed(),
+                                     })
 
         def _flush(self, db, session):
             '''
             Write all pending updates in a single transaction.
             Do not call this directly; call flush().
             '''
-            db.stats.stat_inc('flushes')
             query = db.query_DbEntTargetObj.with_session(session)
             upsert_dbe_list = list()
             upsert_tobj_list = list()
@@ -1328,7 +1362,7 @@ class ClfsLoadDB():
             # those are non-empty, must_flush is set.
             buffering_len = len(db.toc_buffering)
             if (buffering_len >= db.toc_buffering.flush_dirty_count_min) \
-              or (db.toc_buffering.must_flush and (buffering_len or (db.toc_flushing is None))) \
+              or (db.toc_buffering.must_flush and (db.toc_flushing is None) and (not db.toc_flush_list)) \
               or ((not db.toc_flush_list) and buffering_len and db.toc_buffering.flush_for_time_or_idle(db)):
                 db.move_current_toc_to_toc_flush_NL()
             else:
@@ -1729,13 +1763,13 @@ class ClfsLoadDB():
                     continue
                 if dbe.state not in self.DB_BACKPOINTER_CHECK_STATES:
                     logger.error("post_reconcile db_backpointer_check found %s (%s) with unexpected state %s",
-                                 dbe.filehandle.hex(), dbe.source_path, dbe.state)
+                                 dbe.filehandle.hex(), dbe.source_path_str, dbe.state)
                     raise SystemExit(1)
                 # Warn but do not treat as an error. This can happen
                 # if the source is modified during the transfer (including
                 # while the transfer is stopped and restarted).
                 logger.warning("post_reconcile db_backpointer_check found %s (%s) orphaned",
-                               dbe.filehandle.hex(), dbe.source_path)
+                               dbe.filehandle.hex(), dbe.source_path_str)
                 dbe.state = TargetObjState.ERROR
                 session.commit()
         finally:
@@ -1969,7 +2003,9 @@ class _DBSessionWrapper():
         '''
         Generate and return a new session with the transaction started.
         The caller is responsible for using session_release() to
-        destroy the session.
+        destroy the session. This performs no sanity checks
+        on the overall DB state - callers such as db_count_all()
+        rely on that.
         '''
         ret = Session(bind=self._engine, autoflush=False, _enable_transaction_accounting=False)
         self._count += 1
@@ -2016,6 +2052,7 @@ class PreclaimState():
         self._phase = None
         self._lowat_count = 0 # low-water count; preclaim more if we have fewer than hits
         self._hiwat_count = 0 # when we preclaim, aim for this many
+        self._preclaim_max_at_once = 1 # max query size for preclaim
 
         self.accepted_all_offers = True # fastpath out of preclaim_more()
         self.get_one = None # proc, set in phase.setter
@@ -2060,10 +2097,13 @@ class PreclaimState():
 
     _TRANSFER_LOWAT = 300
     _TRANSFER_HIWAT = 10000
+    _TRANSFER_PRECLAIM_MAX_AT_ONCE = 1000
     _RECONCILE_LOWAT = 600
     _RECONCILE_HIWAT = 10000
+    _RECONCILE_PRECLAIM_MAX_AT_ONCE = 150
     _CLEANUP_LOWAT = 5000
     _CLEANUP_HIWAT = 10000
+    _CLEANUP_PRECLAIM_MAX_AT_ONCE = 150
 
     @phase.setter
     def phase(self, value):
@@ -2071,18 +2111,22 @@ class PreclaimState():
         if self._phase == Phase.TRANSFER:
             self._lowat_count = self._TRANSFER_LOWAT
             self._hiwat_count = self._TRANSFER_HIWAT
+            self._preclaim_max_at_once = self._TRANSFER_PRECLAIM_MAX_AT_ONCE
             self.get_one = self._get_one_transfer
         elif self._phase == Phase.RECONCILE:
             self._lowat_count = self._RECONCILE_LOWAT
             self._hiwat_count = self._RECONCILE_HIWAT
+            self._preclaim_max_at_once = self._RECONCILE_PRECLAIM_MAX_AT_ONCE
             self.get_one = self._get_one_reconcile
         elif self._phase == Phase.CLEANUP:
             self._lowat_count = self._CLEANUP_LOWAT
             self._hiwat_count = self._CLEANUP_HIWAT
+            self._preclaim_max_at_once = self._CLEANUP_PRECLAIM_MAX_AT_ONCE
             self.get_one = self._get_one_cleanup
         else:
             self._lowat_count = 0
             self._hiwat_count = 0
+        self._preclaim_max_at_once = 150
 
     def ready_count(self):
         'Return the number of items ready for claim'
@@ -2220,6 +2264,7 @@ class PreclaimState():
         if (have > self._hiwat_count) and self._generating_dirs:
             return
         remaining = self._hiwat_count - have
+        remaining = min(remaining, self._preclaim_max_at_once)
         query = query.filter(DbEntTargetObj.state == TargetObjState.PENDING)
 
         # Something to think about: Should this query order by size, pulling largest first?
@@ -2268,6 +2313,7 @@ class PreclaimState():
         Lay claim to more objects.
         '''
         remaining = self._hiwat_count - len(self._writing_inodes)
+        remaining = min(remaining, self._preclaim_max_at_once)
         if remaining > 0:
             query = query.filter(DbEntTargetObj.state == TargetObjState.INODE_PENDING)
             query = query.limit(remaining)
@@ -2288,6 +2334,7 @@ class PreclaimState():
         Lay claim to more objects.
         '''
         remaining = self._hiwat_count - len(self._cleaning_inodes)
+        remaining = min(remaining, self._preclaim_max_at_once)
         if remaining > 0:
             query = query.filter(DbEntTargetObj.state == TargetObjState.INODE_CLEANUP_PENDING)
             query = query.limit(remaining)

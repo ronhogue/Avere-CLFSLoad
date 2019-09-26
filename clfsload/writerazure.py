@@ -16,10 +16,6 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 
-from __future__ import absolute_import
-from __future__ import division
-from __future__ import print_function
-
 import collections
 import http.client
 import inspect
@@ -46,13 +42,13 @@ from clfsload.parse import BlockListManager, CLFSBucketObjAttrs, CLFSSegment, Ft
                            obj_reconcile, parse_obj, strip_compression_header_and_decompress, \
                            unparse_inode, unparse_obj_handles, unparse_segment, unparse_segment_using_obid
 from clfsload.reader import ClfsReadAhead
-from clfsload.types import AbortException, Btype, CLFSCompressionType, CLFSLoadException, \
-                           ContainerTerminalError, \
-                           FILEHANDLE_INODE_INPROGRESS, \
-                           MKNOD_FTYPES, NamedObjectError, \
-                           ObCacheId, ServerRejectedAuthError, \
-                           SimpleError, SourceObjectError, TargetObj, \
-                           TargetObjectError, TerminalError, WRock
+from clfsload.stypes import AbortException, Btype, CLFSCompressionType, CLFSLoadException, \
+                            ContainerTerminalError, \
+                            FILEHANDLE_INODE_INPROGRESS, \
+                            MKNOD_FTYPES, NamedObjectError, \
+                            ObCacheId, ServerRejectedAuthError, \
+                            SimpleError, SourceObjectError, TargetObj, \
+                            TargetObjectError, TerminalError, WRock
 from clfsload.util import STRUCT_LE_U32, Size, elapsed, \
                           exc_info_err, exc_log, exc_stacklines, getframe
 from clfsload.writer import Writer
@@ -894,14 +890,10 @@ class WriterAzure(Writer):
             gb = len(segment_bytes) / Size.GB
             if remaining_gb:
                 if gb >= remaining_gb:
-                    wrock.stats.stat_update({'gb_write' : remaining_gb,
-                                             'gb_read': remaining_gb,
-                                            })
+                    wrock.stats.stat_add('gb_write', remaining_gb)
                     remaining_gb = 0.0
                 else:
-                    wrock.stats.stat_update({'gb_write' : gb,
-                                             'gb_read' : gb,
-                                            })
+                    wrock.stats.stat_add('gb_write', gb)
                     remaining_gb -= gb
             out_offset += CLFSSegment.DIR_OTHER_SEGMENT_BYTES
             out_block_index += 1
@@ -919,12 +911,11 @@ class WriterAzure(Writer):
             if tobj.ftype == Ftype.LNK:
                 try:
                     link_target = reader.readlink(tobj)
-                    wrock.stats.stat_add('gb_read', tobj.size / Size.GB)
                 except (NamedObjectError, TerminalError):
                     raise
                 except Exception as e:
                     raise SourceObjectError(tobj, exc_info_err()) from e
-                first_segment_bytes = bytes(link_target, encoding='utf_8')
+                first_segment_bytes = os.fsencode(link_target)
                 first_segment_len = len(first_segment_bytes)
                 tobj.size = len(link_target)
                 self._transfer_write_inode(wrock, tobj, block_manager, first_segment_bytes, first_segment_len / Size.GB, Btype.BTYPE_LNK, [tobj.first_backpointer])
@@ -982,7 +973,6 @@ class WriterAzure(Writer):
         Perform transfer() on tobj with type REG using a single thread
         '''
         first_segment_bytes = self._do_read(wrock, file_reader, tobj, CLFSSegment.FIRST_SEGMENT_BYTES, 'read_st')
-        wrock.stats.stat_add('gb_read', len(first_segment_bytes) / Size.GB)
         first_segment_len = len(first_segment_bytes)
         out_offset = CLFSSegment.FIRST_SEGMENT_BYTES
         # if file length <= FIRST_SEGMENT_BYTES then seek(out_offset, io.SEEK_CUR)
@@ -998,7 +988,6 @@ class WriterAzure(Writer):
                 indir_list = block_manager.flush_indir_tree_final()
                 self._flush_indir_blocks_in_list(wrock, tobj, indir_list)
                 break   #all file data read
-            wrock.stats.stat_add('gb_read', len(segment_bytes) / Size.GB)
             size += len(segment_bytes)
             # out_offset in output file is used only to be passed into unparse_segment for creation
             # databack block -- the size header is set from len(segment_bytes).
@@ -1030,7 +1019,6 @@ class WriterAzure(Writer):
         '''
         first_segment_bytes = self._do_read(wrock, read_ahead_obj, tobj, CLFSSegment.FIRST_SEGMENT_BYTES, 'read_mt')
         first_segment_len = len(first_segment_bytes)
-        wrock.stats.stat_add('gb_read', first_segment_len / Size.GB)
         out_offset = CLFSSegment.FIRST_SEGMENT_BYTES
         # if file length <= FIRST_SEGMENT_BYTES then seek(out_offset, io.SEEK_CUR)
         # takes us beyond EOF in the input file, and the loop below
@@ -1046,7 +1034,6 @@ class WriterAzure(Writer):
                 indir_list = block_manager.flush_indir_tree_final()
                 self._flush_indir_blocks_in_list(wrock, tobj, indir_list)
                 break   #all file data read
-            wrock.stats.stat_add('gb_read', len(segment_bytes) / Size.GB)
             size += len(segment_bytes)
             # out_offset in output file is used only to be passed into unparse_segment for creation
             # databack block -- the size header is set from len(segment_bytes).
@@ -1104,7 +1091,7 @@ class WriterAzure(Writer):
         '''
         list_blobs_kwargs = {'prefix' : list_manager.prefix}
         while True:
-            c = _MSApiCall(self, tobj, wrock.blob_client._list_blobs, self._container_name, **list_blobs_kwargs) # pylint: disable=protected-access
+            c = _MSApiCall(self, tobj, wrock.blob_client.list_blobs, self._container_name, **list_blobs_kwargs)
             res = c.doit()
             if not res:
                 return
@@ -1210,13 +1197,15 @@ class WriterAzure(Writer):
                                     ownerFh=tObj.filehandle)
         self.write_blob_from_buffer(bucketObjName, tObj, objba, wrock)
 
-    def finalize(self, wrock, root_fh, root_tobj, logfile_dir):
-        'See base class'
-        log_file_list = sorted([log_file for log_file in os.listdir(logfile_dir) if log_file.endswith('.txt')])
+    def finalize(self, wrock, root_fh, root_tobj, logfile_dir, logfile_names):
+        '''
+        See base class
+        '''
+        logfile_paths = [os.path.join(logfile_dir, x) for x in logfile_names]
         # write log files to container
-        self._save_files_to_container([os.path.join(logfile_dir, x) for x in log_file_list])
+        self._save_files_to_container(logfile_paths)
         # add extattrs to bucket obj
-        self._update_extattrs_in_bucket_obj(wrock, log_file_list)
+        self._update_extattrs_in_bucket_obj(wrock, logfile_names)
         # root directory inode is under a temporary name in the container to ensure that we cannot
         # mount root dir until we are done. Copy contents to the correct name for root dir inode
         # and delete object with temporary name.

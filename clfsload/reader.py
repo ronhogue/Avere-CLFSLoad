@@ -22,9 +22,6 @@ At this time, ReaderPosix is the only reader that is implemented.
 ReadPosix uses local filesystem operations to scan the source.
 '''
 
-from __future__ import absolute_import
-from __future__ import print_function
-
 import logging
 import os
 import queue
@@ -33,9 +30,9 @@ import threading
 
 from clfsload.dryrunhelper import DryRunHelper
 from clfsload.parse import CLFSSegment
-from clfsload.types import ClassExportedBase, FILEHANDLE_NULL, FILEHANDLE_ROOT, Ftype, \
-                           NamedObjectError, ReaderInfo, ReaderWriterBase, SourceObjectError, \
-                           TargetObj, TargetObjState
+from clfsload.stypes import ClassExportedBase, FILEHANDLE_NULL, FILEHANDLE_ROOT, Ftype, \
+                            NamedObjectError, ReaderInfo, ReaderWriterBase, SourceObjectError, \
+                            TargetObj, TargetObjState
 from clfsload.util import Size, exc_info_err, exc_info_name, exc_log
 
 class ReadFileBase(ClassExportedBase):
@@ -328,7 +325,7 @@ class ReaderPosix(Reader):
         if isinstance(tobj, str):
             source_path = tobj
         else:
-            source_path = tobj.source_path
+            source_path = tobj.source_path_str
         try:
             return os.readlink(source_path)
         except Exception as e:
@@ -343,7 +340,7 @@ class ReaderPosix(Reader):
         if isinstance(tobj, str):
             source_path = tobj
         else:
-            source_path = tobj.source_path
+            source_path = tobj.source_path_str
         try:
             return self.input_file_reader(source_path)
         except SourceObjectError:
