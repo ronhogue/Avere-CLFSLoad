@@ -2307,7 +2307,7 @@ class CLFSLoad():
               ]
         mdd.extend(self._command_args.target_metastore())
         self._db.db_meta_set(mdd)
-        self._db.phase = Phase.INIT
+        self._set_phase(Phase.INIT)
         # Now that we know the metastore contents, generate state from it
         self._propagate_values()
         # We need the toc thread to handle the root object upsert
@@ -2540,6 +2540,9 @@ class CLFSLoad():
             self.fatal = str(e)
             raise SystemExit(1) from e
 
+        if self.azcopy:
+            self.azcopy_do_report_config()
+
         if self._command_args.dry_run:
             dry_run_db = DryRunResult.get_from_db(self.db)
             logger.info("perform dry run on %s", self._source_root_path)
@@ -2586,9 +2589,8 @@ class CLFSLoad():
         del wrock_init
 
         if phase == Phase.TRANSFER:
-            logger.info("begin phase transfer")
             self.did_transfer = True
-            self._db.phase = Phase.TRANSFER
+            self._set_phase(Phase.TRANSFER)
             self._db_launch_fhseq_thread()
             # Do not save a pointer to pool - it contains a backpointer to self
             pool = self._transfer_worker_pool_class(self, self._command_args.worker_thread_count)
@@ -2609,9 +2611,8 @@ class CLFSLoad():
                 phase = Phase.FINALIZE
 
         if phase == Phase.RECONCILE:
-            logger.info("begin phase reconcile")
             self.did_reconcile = True
-            self._db.phase = Phase.RECONCILE
+            self._set_phase(Phase.RECONCILE)
             self.reconcile_total_count = self._db.db_get_reconcile_pending_count()
             logger.debug("reconcile count %d", self.reconcile_total_count)
             if self.reconcile_total_count:
@@ -2624,9 +2625,8 @@ class CLFSLoad():
             phase = Phase.CLEANUP
 
         if phase == Phase.CLEANUP:
-            logger.info("begin phase cleanup")
             self.did_cleanup = True
-            self._db.phase = Phase.CLEANUP
+            self._set_phase(Phase.CLEANUP)
             self.cleanup_total_count = self._db.db_get_cleanup_pending_count()
             logger.info("cleanup count %d", self.cleanup_total_count)
             if self.cleanup_total_count:
@@ -2640,11 +2640,10 @@ class CLFSLoad():
         any_errors = False
 
         if phase == Phase.FINALIZE:
-            logger.info("begin phase finalize")
+            self._set_phase(Phase.FINALIZE)
             wrock = WRock(self._logger, self._run_options, 'main.finalize', 0, self._writer)
             wrock.stats = FinalizeStats()
             wrock.timers = TimerStats()
-            self._db.phase = Phase.FINALIZE
             any_errors = self._phase_finalize(wrock)
             del wrock
 
@@ -2667,8 +2666,20 @@ class CLFSLoad():
             raise SystemExit(1)
 
         logger.info("CLFSLoad succeeded")
-        self._db.phase = Phase.DONE
         return 0
+
+    def _set_phase(self, phase):
+        '''
+        Update the phase
+        '''
+        logger = self.logger
+        phase_str = phase.azcopy_name()
+        if self.azcopy:
+            rpt = {'phase' : phase_str}
+            logger.info("begin phase %s\n%s", phase_str.lower(), self.azcopy_report_info_string(rpt))
+        else:
+            logger.info("begin phase %s", phase_str.lower())
+        self._db.phase = phase
 
     def post_reconcile_sanity(self):
         '''
@@ -2778,6 +2789,18 @@ class CLFSLoad():
         '''
         return self.db.db_tobj_get(self._target_root_filehandle)
 
+    def azcopy_do_report_config(self):
+        '''
+        Generate and log the configuration report to azcopy.
+        Call this exactly once per azcopy run.
+        '''
+        rpt = {'compression' : self._compression.upper(),
+               'new' : bool(self._command_args.new),
+               'preserve_hardlinks' : bool(self._preserve_hardlinks),
+               'version' : VERSION_STRING,
+              }
+        self.logger.info("azcopy:\n%s", self.azcopy_report_config_string(rpt))
+
     def azcopy_do_report_final(self, time_elapsed, final_job_status):
         '''
         Generate and log the final azcopy report.
@@ -2786,17 +2809,19 @@ class CLFSLoad():
         time_elapsed = float(time_elapsed)
         final_job_status = str(final_job_status)
         try:
-            total = self.db.db_count_all()
+            dr_final = self.db.db_get_progress()
+            total = dr_final.dr_count
         except:
             total = None
-        try:
-            done = int(self.db.db_count_in_state(TargetObjState.DONE))
-        except:
-            done = None
         try:
             failed = int(self.db.db_count_in_state(TargetObjState.ERROR))
         except:
             failed = None
+        try:
+            done = max(total-failed, 0)
+        except:
+            done = None
+
         try:
             progress = self.db.db_get_progress()
             total_bytes_transferred = int(progress.dr_gb * Size.GB)
@@ -2811,6 +2836,24 @@ class CLFSLoad():
                'total_bytes_transferred' : total_bytes_transferred,
               }
         self.logger.info("azcopy:\n%s", self.azcopy_report_final_string(rpt))
+
+    @staticmethod
+    def azcopy_report_config_string(azcopy_rpt):
+        '''
+        Given a report in dict form (azcopy_rpt), generate the output string for azcopy.
+        The caller is expected to log this on a line by itself,
+        followed by a newline.
+        '''
+        return 'AZCOPY-CONFIG:' + json.dumps(azcopy_rpt, separators=(',', ':'), check_circular=False)
+
+    @staticmethod
+    def azcopy_report_info_string(azcopy_rpt):
+        '''
+        Given a report in dict form (azcopy_rpt), generate the output string for azcopy.
+        The caller is expected to log this on a line by itself,
+        followed by a newline.
+        '''
+        return 'AZCOPY-INFO:' + json.dumps(azcopy_rpt, separators=(',', ':'), check_circular=False)
 
     @staticmethod
     def azcopy_report_interval_string(azcopy_rpt):

@@ -57,7 +57,7 @@ LOG_FORMAT = "%(asctime)s %(levelname).3s %(message)s"
 
 def logger_create(log_level, name=LOGGER_NAME):
     log_format = LOG_FORMAT
-    logging.basicConfig(format=log_format)
+    logging.basicConfig(format=log_format, stream=sys.stdout)
     logger = logging.getLogger(name=name)
     logger.setLevel(log_level_get(log_level))
     return logger

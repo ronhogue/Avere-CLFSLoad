@@ -33,9 +33,10 @@ Install Python 3 according to the instructions for your Linux distribution.
 
 ## Installation
 
-You can install Avere-CLFSLoad on a physical Linux workstation or on a VM. (Read
-[Running on Azure virtual machines](#running-on-azure-virtual-machines) for VM
-recommendations.)
+You can install Avere-CLFSLoad on a physical Linux workstation or on a
+VM. (Read [Running on Azure virtual machines](#running-on-azure-virtual-machines)
+for VM recommendations.) Execute these installation instructions from the root
+of the CLFSLoad distribution:
 
 This example creates a Python virtual environment and installs CLFSLoad:
 

@@ -153,7 +153,8 @@ class CommandArgs():
         self._handle_compression_args = getattr(self, '_handle_compression_args', len(self.COMPRESSION_TYPE_DEFAULT) > 1)
         self._handle_encryption_args = getattr(self, '_handle_encryption_args', len(self.ENCRYPTION_TYPES) > 1)
         self._handle_preserve_hardlinks_args = getattr(self, '_handle_preserve_hardlinks_args', True)
-        self._handle_retry_error_args = getattr(self, '_handle_retry_error_args', True)
+        self._handle_error_args = getattr(self, '_handle_error_args', True)
+        self._handle_worker_thread_count_args = getattr(self, '_handle_worker_thread_count_args', True)
         self._parser = argparse.ArgumentParser(prog=self._prog)
         if add_version:
             self._parser.add_argument("--version", action="version",
@@ -182,7 +183,7 @@ class CommandArgs():
                                       help="start a new transfer")
         if self._handle_azcopy_args:
             self._parser.add_argument("--azcopy", action="store_true",
-                                      help="executing on behalf of azcopy")
+                                      help=argparse.SUPPRESS)
         else:
             self.azcopy = False
         if self._handle_dry_run_args:
@@ -202,24 +203,27 @@ class CommandArgs():
                                       help="type of compression to enable (default=%s)" % self.COMPRESSION_TYPE_DEFAULT)
         else:
             self.compression = self.COMPRESSION_TYPE_DEFAULT
-        if self._handle_encryption_args:
+        if self._handle_encryption_args and (len(self.ENCRYPTION_TYPES) > 1):
             self._parser.add_argument("--encryption", type=str, default='', # empty default for resume case
                                       choices=self.ENCRYPTION_TYPES,
                                       help="type of encryption to enable (default=%s)" % self.ENCRYPTION_TYPE_DEFAULT)
         else:
+            self._handle_encryption_args = False
             self.encryption = self.ENCRYPTION_TYPE_DEFAULT
-        self._parser.add_argument("--worker_thread_count", type=int, default=self.worker_thread_count,
-                                  help="number of worker threads (default %s)" % self.worker_thread_count)
-        self._parser.add_argument("--max_errors", type=int, default=self.max_errors,
-                                  help="maximum number of errors to tolerate (0=unlimited)")
+        if self._handle_worker_thread_count_args:
+            self._parser.add_argument("--worker_thread_count", type=int, default=self.worker_thread_count,
+                                      help=argparse.SUPPRESS)
+        if self._handle_error_args:
+            self._parser.add_argument("--max_errors", type=int, default=self.max_errors,
+                                      help="maximum number of errors to tolerate (0=unlimited)")
         if self._handle_preserve_hardlinks_args:
             self._parser.add_argument("--preserve_hardlinks", type=int, default=self.preserve_hardlinks,
                                       help="preserve hardlinks (default=%s)" % self.preserve_hardlinks)
-        if self._handle_retry_error_args:
+        if self._handle_error_args:
             self._parser.add_argument("--retry_errors", type=int, default=self.retry_errors,
                                       help="retry errors from previous run (ignored with --new)")
         self._parser.add_argument("--log_level", type=str, default=logging.getLevelName(self._logger.level),
-                                  help="logging level")
+                                  help="logging level (debug,info,warning,error)")
         self._added_arg_names = list()
         self._args = None
         self.local_state_path = None
@@ -316,12 +320,14 @@ class CommandArgs():
                 self.compression = self.COMPRESSION_TYPE_DEFAULT
             if self.new and (not self.encryption):
                 self.encryption = self.ENCRYPTION_TYPE_DEFAULT
-        new_worker_thread_count = self._worker_thread_count_effective(self._args.worker_thread_count)
-        if new_worker_thread_count != self._args.worker_thread_count:
-            logger.warning("adjusted worker_thread_count from %s to %s",
-                           self._args.worker_thread_count, new_worker_thread_count)
-        self.worker_thread_count = new_worker_thread_count
-        self.max_errors = self._args.max_errors
+        if self._handle_worker_thread_count_args:
+            new_worker_thread_count = self._worker_thread_count_effective(self._args.worker_thread_count)
+            if new_worker_thread_count != self._args.worker_thread_count:
+                logger.warning("adjusted worker_thread_count from %s to %s",
+                               self._args.worker_thread_count, new_worker_thread_count)
+            self.worker_thread_count = new_worker_thread_count
+        if self._handle_error_args:
+            self.max_errors = self._args.max_errors
         if self._handle_preserve_hardlinks_args:
             self.preserve_hardlinks = self._args.preserve_hardlinks
         else:
