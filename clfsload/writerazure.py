@@ -43,6 +43,7 @@ from clfsload.parse import BlockListManager, CLFSBucketObjAttrs, CLFSSegment, Ft
                            unparse_inode, unparse_obj_handles, unparse_segment, unparse_segment_using_obid
 from clfsload.reader import ClfsReadAhead
 from clfsload.stypes import AbortException, Btype, CLFSCompressionType, CLFSLoadException, \
+                            CLFSLoadThread, \
                             ContainerTerminalError, \
                             FILEHANDLE_INODE_INPROGRESS, \
                             MKNOD_FTYPES, NamedObjectError, \
@@ -513,7 +514,7 @@ class TransferThreadPool():
         'accessor'
         return self._should_run
 
-class TransferThread(threading.Thread):
+class TransferThread(CLFSLoadThread):
     '''
     A single thread responsible for writing blobs for regular files to the target.
     Threads wait on a condvar for writes to show up on a deque, and then execute those writes.

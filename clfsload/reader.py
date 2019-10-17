@@ -30,7 +30,7 @@ import threading
 
 from clfsload.dryrunhelper import DryRunHelper
 from clfsload.parse import CLFSSegment
-from clfsload.stypes import ClassExportedBase, FILEHANDLE_NULL, FILEHANDLE_ROOT, Ftype, \
+from clfsload.stypes import CLFSLoadThread, ClassExportedBase, FILEHANDLE_NULL, FILEHANDLE_ROOT, Ftype, \
                             NamedObjectError, ReaderInfo, ReaderWriterBase, SourceObjectError, \
                             TargetObj, TargetObjState
 from clfsload.util import Size, exc_info_err, exc_info_name, exc_log
@@ -373,7 +373,7 @@ class ClfsReadAhead():
         self._cond = threading.Condition(lock=self._lock)
         self._thread = None
         self.error = None
-        self._thread = threading.Thread(target=self.readAheadThread, name='readahead', args=(logger,))
+        self._thread = CLFSLoadThread(target=self.readAheadThread, name='readahead', args=(logger,))
         self._thread.start()
 
     def __str__(self):

@@ -50,6 +50,15 @@ CLFS_SYMLINK_LENGTH_MAX = 1023
 # each time we decide we need to (re-)reconcile the object.
 OBJ_VERSION_INITIAL = 9
 
+class CLFSLoadThread(threading.Thread):
+    '''
+    Thread created directly by CLFSLoad. If a thread does not have
+    this class, then it is created by something outside CLFSLoad itself,
+    though it may be associated with a CLFSLoad resource (for example,
+    a QueueFeederThread).
+    '''
+    # no specialization here
+
 class CLFSCompressionType():
     '''
     constants used in the object header indicating whether object is compressed or not.
@@ -1420,7 +1429,7 @@ class WorkerThreadStats(GenericStats):
         self._throughput_Mbps = None # megabits per second
         self._throughput_delta_secs = None # window size for self._throughput_Mbps
         self.throughput_last_time = None # last time self._throughput_Mbps was sampled
-        self._throughput_last_gb_completed = 0.0
+        self.throughput_last_gb_completed = 0.0
         self.__eta = None
         self._pct_files = None
         self._pct_bytes = None
@@ -1524,17 +1533,17 @@ class WorkerThreadStats(GenericStats):
                 te = elapsed(self.throughput_last_time, cur_ts)
                 if te > 0.0:
                     self._throughput_delta_secs = te
-                    gb = max(self._gb_completed - self._throughput_last_gb_completed, 0.0)
+                    gb = max(self._gb_completed - self.throughput_last_gb_completed, 0.0)
                     megabits = gb * 8192.0 # gigabytes to megabits
                     self._throughput_Mbps = megabits / te
-                    self._throughput_last_gb_completed = self._gb_completed
+                    self.throughput_last_gb_completed = self._gb_completed
                     self.throughput_last_time = cur_ts
                 # If te <= 0.0, the clock did not advance.
                 # Do not update throughpuut values.
                 # When the clock advances, we will see the
                 # accumulated bytecount changes.
             else:
-                self._throughput_last_gb_completed = self._gb_completed
+                self.throughput_last_gb_completed = self._gb_completed
                 self.throughput_last_time = cur_ts
         else:
             self._bytes_completed = None

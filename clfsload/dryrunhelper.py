@@ -23,7 +23,7 @@ import collections
 import logging
 import threading
 
-from clfsload.stypes import CLFS_LINK_MAX, DryRunResult, Ftype, ReaderInfo, SimpleError
+from clfsload.stypes import CLFSLoadThread, CLFS_LINK_MAX, DryRunResult, Ftype, ReaderInfo, SimpleError
 from clfsload.util import Size, exc_info_err, exc_log, getframe
 
 class _ThreadState():
@@ -31,7 +31,7 @@ class _ThreadState():
     def __init__(self, thread_num, target):
         self._thread_num = thread_num
         self._name = "dryrun-thread-%02d" % self._thread_num
-        self._thread = threading.Thread(target=target, name=str(self), args=(self,))
+        self._thread = CLFSLoadThread(target=target, name=str(self), args=(self,))
         # Accumulate per-thread results to avoid locking shared results for every access
         self.result = DryRunResult()
 

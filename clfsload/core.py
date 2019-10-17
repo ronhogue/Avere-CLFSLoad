@@ -43,7 +43,9 @@ from clfsload.pcom import PcomDirectoryWrite, PcomInit, \
                           PcomTobjDone, PcomTransfer, ProcessQueues, ProcessWRock
 from clfsload.reader import ReaderPosix, ReadFilePosix
 from clfsload.stypes import BackpointerLimitReached, CLFS_LINK_MAX, \
-                            CLFSCompressionType, CLFSEncryptionType, CleanupStats, \
+                            CLFSCompressionType, CLFSEncryptionType, \
+                            CLFSLoadThread, \
+                            CleanupStats, \
                             CommandArgs, ContainerTerminalError, \
                             DbEntMetaKey, DbInconsistencyError, DbTerminalError, \
                             DryRunResult, ExistingTargetObjKey, Filehandle, \
@@ -139,7 +141,7 @@ class FileCleaner():
             self._started = True
             self._running = True
             # Do not save a pointer to self._thread - circular dependency
-            thread = threading.Thread(target=self._run, name=self._name)
+            thread = CLFSLoadThread(target=self._run, name=self._name)
             thread.start()
 
     def stop(self):
@@ -319,6 +321,14 @@ class WorkerProcessState():
         logfile_name = "output.%s.txt" % self.name
         return os.path.join(self.local_state_path, logfile_name)
 
+class WorkerPoolThread(CLFSLoadThread):
+    '''
+    Thread used by the worker pool. The class of the
+    thread is used below, so this is interesting even
+    without specialization.
+    '''
+    # no specialization here
+
 class WorkerPool():
     'A pool of worker threads'
 
@@ -332,6 +342,9 @@ class WorkerPool():
 
     # How long to wait (seconds) for a child process to be ready
     WAIT_CHILD_PROCESS_READY = 5.0
+
+    # How long to wait (seconds) for threads to join when unwinding
+    JOIN_WAIT = 2.0
 
     def __init__(self, clfsload, num_threads):
         self._clfsload = clfsload
@@ -368,6 +381,7 @@ class WorkerPool():
             self._phase_name = ''
         self._stats_t0 = None
         self._stats_throughput_last_time = None
+        self._stats_throughput_last_gb_completed = None
 
     @property
     def db(self):
@@ -417,6 +431,7 @@ class WorkerPool():
         # Create but do not start the threads
         self._stats_t0 = time.time()
         self._stats_throughput_last_time = self._stats_t0
+        self._stats_throughput_last_gb_completed = 0.0
         for thread_num in range(self._num_threads):
             wts = WorkerThreadState(self._clfsload.thread_shared_state,
                                     self._clfsload.logger,
@@ -427,13 +442,14 @@ class WorkerPool():
                                     self._clfsload.writer)
             wts.stats.t0 = self._stats_t0
             wts.stats.throughput_last_time = self._stats_t0
+            wts.stats.throughput_last_gb_completed = 0.0
             self._thread_states.append(wts)
             if self._use_process:
                 wps_name = "process-%s-%s" % (self._phase, thread_num)
                 wps = self._wps_create(wps_name, wts)
                 wts.wps = wps
                 wts.process = multiprocessing.Process(target=_one_process_run, name=wps_name, args=(wps,), daemon=False)
-            wts.thread = threading.Thread(target=self._one_thread_run, name=str(wts), args=(wts,))
+            wts.thread = WorkerPoolThread(target=self._one_thread_run, name=str(wts), args=(wts,))
         try:
             self._run_threads()
         except (KeyboardInterrupt, SystemExit) as e:
@@ -462,6 +478,23 @@ class WorkerPool():
             # an exception bubbling up above that left a lock held.
             notify_all(cond)
         Psutil.cleanup_children(logger)
+        # We do not want to get stuck waiting for threads here.
+        # Give them a little time to unwind.
+        join_deadline = time.time() + self.JOIN_WAIT
+        time.sleep(0) # yield to give threads a chance to process wakeups
+        for thread in threading.enumerate():
+            if thread is threading.current_thread():
+                continue
+            if isinstance(thread, CLFSLoadThread) and (not isinstance(thread, WorkerPoolThread)):
+                # CLFSLoad thread created by some other part of CLFSLoad,
+                # such as the file cleaner or a db thread.
+                continue
+            cur_ts = time.time()
+            if cur_ts >= join_deadline:
+                # timeout
+                break
+            join_wait = elapsed(cur_ts, join_deadline)
+            thread.join(timeout=join_wait)
         if (not self._execute_work_items) or terminate:
             # We got a terminal error earlier
             raise SystemExit(1)
@@ -705,6 +738,7 @@ class WorkerPool():
         stats = self._stats_class()
         stats.t0 = self._stats_t0
         stats.throughput_last_time = self._stats_throughput_last_time
+        stats.throughput_last_gb_completed = self._stats_throughput_last_gb_completed
         timers = TimerStats()
         for wts in self._thread_states:
             stats.add(wts.stats, logger)
@@ -718,9 +752,10 @@ class WorkerPool():
                         report_is_interval=report_is_interval,
                         report_is_final=report_is_final,
                         report_full=report_full)
-        # Generating the report updated stats.throughput_last_time.
-        # Save it so we can use it the next time around.
+        # Generating the report updated stats.throughput_last_*/
+        # Save them so we can use them the next time around.
         self._stats_throughput_last_time = stats.throughput_last_time
+        self._stats_throughput_last_gb_completed = stats.throughput_last_gb_completed
         return stats
 
     def _poke(self, num):
@@ -1004,9 +1039,14 @@ class WorkerPool():
         logger = wts.logger
         t0 = time.time()
         log_time_last = t0
+        poll_time_last = t0
+        poll_time_next = t0 + self.WAIT_REMOTE_POLL
+        get_time = min(self.JOIN_WAIT, self.WAIT_REMOTE_POLL)
         while self._clfsload.should_run:
             try:
-                qi = wts.pqueue_wp.get(block=True, timeout=self.WAIT_REMOTE_POLL)
+                t1 = time.time()
+                block_time = min(get_time, elapsed(t1, poll_time_next))
+                qi = wts.pqueue_wp.get(block=True, timeout=block_time)
             except queue.Empty:
                 # We might think about killing and restarting the child here
                 # if things are taking too long. We should at least see stats
@@ -1021,16 +1061,19 @@ class WorkerPool():
                 # Check if the child pid is running at all. If not, then we can
                 # be sure it is gone. If we see the pid, we cannot be sure if the
                 # child is gone or not.
-                wts.stats.stat_inc('wait_remote_empty')
-                try:
-                    with wts.timers.start('get_child_pids'):
-                        pids = Psutil.get_child_pids()[0]
-                    if wts.process_pid not in pids:
-                        logger.error("%s wait_for_remote_done detected child pid=%s not running",
-                                     wts, wts.process_pid)
-                        raise TargetObjectError(tobj, "child process terminated", stack_is_interesting=False)
-                except:
-                    exc_log(logger, logging.WARNING, "%s cannot determine the status of child pid=%s" % (wts, wts.process_pid))
+                t1 = time.time()
+                if t1 >= poll_time_next:
+                    poll_time_next = t1 + self.WAIT_REMOTE_POLL
+                    wts.stats.stat_inc('wait_remote_check_children')
+                    try:
+                        with wts.timers.start('get_child_pids'):
+                            pids = Psutil.get_child_pids()[0]
+                        if wts.process_pid not in pids:
+                            logger.error("%s wait_for_remote_done detected child pid=%s not running",
+                                         wts, wts.process_pid)
+                            raise TargetObjectError(tobj, "child process terminated", stack_is_interesting=False)
+                    except:
+                        exc_log(logger, logging.WARNING, "%s cannot determine the status of child pid=%s" % (wts, wts.process_pid))
                 t1 = time.time()
                 if elapsed(log_time_last, t1) >= 60.0:
                     logger.info("%s wait_for_remote_done still waiting pid=%s elapsed=%.1f %s",
@@ -2808,31 +2851,54 @@ class CLFSLoad():
         '''
         time_elapsed = float(time_elapsed)
         final_job_status = str(final_job_status)
+        db = self.db
+        mdk_meta = [DbEntMetaKey.PHASE]
+        mdk_tobj = [DbEntMetaKey.PROGRESS_COUNT,
+                    DbEntMetaKey.PROGRESS_GB,
+                   ]
+        mdd_meta = dict()
+        mdd_tobj = dict()
+        md_descs = ((mdk_meta, db.dbmeta, 'meta', mdd_meta),
+                    (mdk_tobj, db.dbtobj, 'target object', mdd_tobj),
+                   )
+        for mdk, session_wrapper, desc, mdd in md_descs:
+            try:
+                mdd.update(db.db_meta_get(mdk, session_wrapper=session_wrapper))
+            except:
+                self.logger.warning("cannot retrieve state from %s table in azcopy_do_report_final: %s at %s",
+                                    desc, exc_info_err(), getframe(0))
+                mdd.update({k : None for k in mdk})
+        total = mdd_tobj.get(DbEntMetaKey.PROGRESS_COUNT, None)
+        progress_gb = mdd_tobj.get(DbEntMetaKey.PROGRESS_GB, None)
+        phase = None
+        failed = None
+        done = None
+        total_bytes_transferred = None
         try:
-            dr_final = self.db.db_get_progress()
-            total = dr_final.dr_count
+            if mdd_meta[DbEntMetaKey.PHASE]:
+                phase = mdd_meta[DbEntMetaKey.PHASE].azcopy_name()
         except:
-            total = None
+            self.logger.warning("problem while generating final report: %s at %s", exc_info_err(), getframe(0))
         try:
-            failed = int(self.db.db_count_in_state(TargetObjState.ERROR))
+            failed = int(db.db_count_in_state(TargetObjState.ERROR))
         except:
-            failed = None
+            self.logger.warning("problem while generating final report: %s at %s", exc_info_err(), getframe(0))
         try:
             done = max(total-failed, 0)
         except:
-            done = None
-
+            self.logger.warning("problem while generating final report: %s at %s", exc_info_err(), getframe(0))
         try:
-            progress = self.db.db_get_progress()
-            total_bytes_transferred = int(progress.dr_gb * Size.GB)
+            total_bytes_transferred = int(progress_gb * Size.GB)
         except:
-            total_bytes_transferred = None
+            self.logger.warning("problem while generating final report: %s at %s", exc_info_err(), getframe(0))
+        self.logger.debug("%s total=%s progress_gb=%s failed=%s done=%s", getframe(0), total, progress_gb, failed, done)
         rpt = {'elapsed' : time_elapsed,
                'files_completed_success' : done,
                'files_completed_failed' : failed,
                'files_skipped' : 0,
                'files_total' : total,
                'final_job_status' : str(final_job_status),
+               'phase' : phase,
                'total_bytes_transferred' : total_bytes_transferred,
               }
         self.logger.info("azcopy:\n%s", self.azcopy_report_final_string(rpt))

@@ -40,14 +40,16 @@ from sqlalchemy.orm.query import Query
 from sqlalchemy.orm.session import Session
 
 from clfsload.stypes import AbortException, AdditionalBackpointers, BackpointerLimitReached, \
-                            CLFS_LINK_MAX, DATA_FTYPES, \
+                            CLFS_LINK_MAX, CLFSLoadThread, DATA_FTYPES, \
                             DbEntBase, DbEntAdditionalBackpointerMapEnt, DbEntMeta, DbEntTargetObj, \
                             DBStats, DbEntMetaKey, DbInconsistencyError, DbTerminalError,\
                             DryRunResult, ExistingTargetObjKeyBarrier, \
                             FILEHANDLE_NULL_BYTES, Filehandle, Ftype, Phase, \
                             SimpleError, TargetObjState, \
                             TerminalError, TargetObj, TimerStats
-from clfsload.util import Monitor, Size, elapsed, exc_info_err, exc_log, exc_stack, getframe, notify_all
+from clfsload.util import Monitor, Size, \
+                          current_thread_name, \
+                          elapsed, exc_info_err, exc_log, exc_stack, getframe, notify_all
 
 _CACHE_SIZE = Size.GB
 _JOURNAL_MODE = 'WAL'
@@ -338,7 +340,7 @@ class ClfsLoadDB():
             if not self._terminal_error:
                 self._terminal_error = value
                 if self._terminal_error != 'SystemExit':
-                    self._logger.error("%s DB terminal_error is now '%s'" % (self, self._terminal_error))
+                    self._logger.error("%s DB terminal_error is now '%s' thread='%s'" % (self, self._terminal_error, current_thread_name()))
         self._best_effort_wake_all()
 
     def _stats_reset(self):
@@ -636,7 +638,7 @@ class ClfsLoadDB():
             'Launch the thread'
             with self._run_cond:
                 if not self._started:
-                    self._thread = threading.Thread(target=self._run, name=self._thread_name, args=(db,))
+                    self._thread = CLFSLoadDBThread(target=self._run, name=self._thread_name, args=(db,))
                     self._thread.start()
                     self._started = True
 
@@ -2432,3 +2434,11 @@ class PreclaimState():
             return self._cleaning_inodes.pop()
         except IndexError:
             return None
+
+class CLFSLoadDBThread(CLFSLoadThread):
+    '''
+    Class used for DB threads. No need to specialize
+    the class; this just helps other code (especially
+    test code) identify DB threads.
+    '''
+    # No specialization here

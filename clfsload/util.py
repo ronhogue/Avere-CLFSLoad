@@ -279,6 +279,12 @@ def remove_path(path):
         except FileNotFoundError:
             pass
 
+def current_thread_name():
+    '''
+    Return the name of the current thread
+    '''
+    return getattr(threading.current_thread(), 'name', '') or 'unknown thread ' + hex(id(threading.current_thread()))
+
 class Psutil():
     '''
     Wrap up state for psutil
