@@ -648,6 +648,7 @@ class WorkerPool():
         if self._clfsload.azcopy and report_is_interval:
             azcopy_rpt = self._azcopy_report(srpt)
             if azcopy_rpt:
+                self._clfsload.azcopy_interval_rpt_last = azcopy_rpt
                 rs += '\n'
                 rs += self._clfsload.azcopy_report_interval_string(azcopy_rpt)
         logger.log(log_level, "%s", rs)
@@ -662,10 +663,12 @@ class WorkerPool():
         files_completed_failed = srpt['files_completed_failed']
         files_completed_total = srpt['files_completed_total']
         files_completed_success = max(files_completed_total-files_completed_failed, 0) # files_skipped always 0
+        bytes_completed = srpt['bytes_completed']
 
         # This shows all attributes of the generated report for azcopy.
         # Most of these are updated below.
-        rpt = {'elapsed' : srpt['elapsed'],
+        rpt = {'bytes_completed' : bytes_completed,
+               'elapsed' : srpt['elapsed'],
                'files_completed_failed' : files_completed_failed,
                'files_completed_success' : files_completed_success,
                'files_pending' : None,
@@ -1923,6 +1926,9 @@ class CLFSLoad():
         self.reconcile_total_count = None
         self.cleanup_total_count = None
 
+        # Most recent azcopy iterval report generated
+        self.azcopy_interval_rpt_last = dict()
+
         # Sometimes a fresh SAS token for a fresh container is rejected.
         # If the token is rejected, delay and retry before giving up.
         attempt_cur = 0
@@ -2626,6 +2632,7 @@ class CLFSLoad():
         phase = self._db.db_meta_get(DbEntMetaKey.PHASE)
         logger.debug("initialization complete with phase=%s", phase.value)
         self._run_started = True
+        self.azcopy_interval_rpt_last = dict()
 
         self._propagate_values()
 
@@ -2723,6 +2730,7 @@ class CLFSLoad():
         else:
             logger.info("begin phase %s", phase_str.lower())
         self._db.phase = phase
+        self.azcopy_interval_rpt_last = dict()
 
     def post_reconcile_sanity(self):
         '''
@@ -2868,12 +2876,23 @@ class CLFSLoad():
                 self.logger.warning("cannot retrieve state from %s table in azcopy_do_report_final: %s at %s",
                                     desc, exc_info_err(), getframe(0))
                 mdd.update({k : None for k in mdk})
+            self.logger.debug("%s %s: %s", getframe(0), desc, mdd)
+        rprt_last = self.azcopy_interval_rpt_last
+        self.logger.debug("%s rprt_last %s", getframe(0), rprt_last)
         total = mdd_tobj.get(DbEntMetaKey.PROGRESS_COUNT, None)
         progress_gb = mdd_tobj.get(DbEntMetaKey.PROGRESS_GB, None)
         phase = None
         failed = None
         done = None
         total_bytes_transferred = None
+        if total is None:
+            total = rprt_last.get('files_completed_success', None)
+        else:
+            total = max(total, rprt_last.get('files_completed_success', 0))
+        if progress_gb is None:
+            progress_gb = rprt_last.get('bytes_completed', None)
+        else:
+            progress_gb = max(progress_gb, rprt_last.get('bytes_completed', 0.0))
         try:
             if mdd_meta[DbEntMetaKey.PHASE]:
                 phase = mdd_meta[DbEntMetaKey.PHASE].azcopy_name()
