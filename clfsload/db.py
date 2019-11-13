@@ -1464,8 +1464,9 @@ class ClfsLoadDB():
                 if self.toc_thread_state.any_work_to_do_NL(self):
                     self.toc_run_cond.notify_all()
             elif not self.toc_flushing:
-                # We may be done - wake everyone up to check.
-                self.phase_work_poke(0)
+                if self._all_phase_threads_are_idle:
+                    # We may be done - wake everyone up to check.
+                    self.phase_work_poke(0)
 
     def dbc_check_for_more_work(self):
         '''

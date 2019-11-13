@@ -223,7 +223,7 @@ def exc_stacklines():
     with the exception string removed from the end.
     '''
     exc_info = sys.exc_info()
-    exception_class_names = [exc_info[0].__module__+'.'+exc_info[0].__qualname__, exc_info[0].__name__]
+    exception_class_names = [exc_info[0].__module__+'.'+getattr(exc_info[0], '__qualname__', '?'), exc_info[0].__name__]
     del exc_info
     lines = traceback.format_exc().splitlines()
     lastline = lines[-1]
