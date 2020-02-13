@@ -24,6 +24,7 @@ import setuptools
 requirements = [
                ]
 
+
 def doit():
     logging.basicConfig(level=logging.WARNING)
 
@@ -38,29 +39,36 @@ def doit():
 
     desc_short = 'Avere CLFSLoad ingest Python library and CLFSLoad.py command line utility'
 
-    desc_long = 'The ' + desc_short \
-      + ' provides the ability to ingest data from a rooted source' \
-      + ' into an Azure container in the CLFS format.' \
-      + ' Licensed under the Apache License, Version 2.0.'
+    desc_long = ''
+    with open('README.md', encoding='utf-8') as readme:
+        # Grab header of README as PyPi description
+        for line in readme:
+            if line.startswith('##'):
+                break
+            desc_long += str(line)
 
     setuptools.setup(author='Microsoft Corporation',
+
                      classifiers=['Development Status :: 5 - Production/Stable',
                                   'Environment :: Console',
                                   'Intended Audience :: System Administrators',
                                   'License :: OSI Approved :: Apache Software License',
                                   'Operating System :: POSIX :: Linux',
                                   'Programming Language :: Python :: 3',
-                                 ],
+                                  ],
+                     url='https://github.com/microsoft/Avere-CLFSLoad',
                      description=desc_short,
                      entry_points={'console_scripts' : ['CLFSLoad.py = clfsload.core:main']},
                      install_requires=requirements,
                      keywords='Avere Microsoft',
                      license='Apache 2.0',
                      long_description=desc_long,
+                     long_description_content_type='text/markdown',
                      name='clfsload',
                      packages=['clfsload'],
                      python_requires='~=3.6',
                      version=version.VERSION_STRING,
-                    )
+                     )
+
 
 doit()
