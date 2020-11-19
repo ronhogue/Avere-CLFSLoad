@@ -336,7 +336,7 @@ def get_unparse_handle_list(ftype, objBtype):
 
 def _uncompressed_obj(inbuf):
     header = struct.pack(_COMPRESSION_HEADERS_PACK1, CLFSEncryptionType.DISABLED, CLFSCompressionType.DISABLED)
-    return bytes().join([header, inbuf])
+    return header + inbuf
 
 def _compress_obj(inbuf, wrock):
     '''
@@ -365,20 +365,26 @@ def _compress_obj(inbuf, wrock):
     while cursor < inlen:
         block_length = min(inlen-cursor, CLFSCompressionType.MAXFRAMESIZE)
         compress_block = lz4.frame.compress_chunk(compress_ctx, inbuf[cursor:cursor+block_length])
+        cursor += block_length
+        if not compress_block:
+            continue
         bufs_len += len(compress_block)
         if bufs_len >= max_compressed_len:
             # if compression does not help, skip it
             return _uncompressed_obj(inbuf)
         if len(compress_block) >= 4:
-            (length,) = struct.unpack(STRUCT_LE_U32, compress_block[:4])
+            (blksize,) = struct.unpack(STRUCT_LE_U32, compress_block[:4])
             # highest bit of 4-byte integer is set when block is uncompressed.
             # armada/src/lz4/lz4wrap.cc cannot handle this and will fail with bad block size.
             # If any block is uncompressed, then do not compress object
-            if length > 0x7FFFFFFF:
+            if blksize > 0x7FFFFFFF:
                 return _uncompressed_obj(inbuf)
         bufs.append(compress_block)
-        cursor += block_length
     buf = lz4.frame.compress_flush(compress_ctx, end_frame=True)
+    if len(buf) >= 4:
+        (blksize,) = struct.unpack(STRUCT_LE_U32, buf[:4])
+        if blksize > 0x7FFFFFFF:
+            return _uncompressed_obj(inbuf)
     bufs.append(buf)
     bufs_len += len(buf)
     if bufs_len > max_compressed_len:
