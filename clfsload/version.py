@@ -16,6 +16,6 @@
 # limitations under the License.
 #--------------------------------------------------------------------------
 
-__version_info__ = (1, 0, 23, 0) # pylint: disable=invalid-name
+__version_info__ = (1, 0, 24, 0) # pylint: disable=invalid-name
 __version__ = '.'.join([str(x) for x in __version_info__[:3]])
 VERSION_STRING = __version__
